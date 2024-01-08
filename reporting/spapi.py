@@ -13,8 +13,8 @@ from spotipy import oauth2
 config_path = utl.config_path
 # replace later, my test client_details
 account_id = ''
-client_id = 'cfb799e8647a4ad4b5767f6ef17b59ca'
-client_secret = '45779f45eefd41328018232e4fe871b0'
+client_id = 
+client_secret = 
 redirect_uri = 'http://localhost:8080/callback'
 token_url = 'https://accounts.spotify.com/api/token'
 api_base_url = 'https://api-partner.spotify.com/ads/v2/'
@@ -30,8 +30,8 @@ class SpApi(object):
     def __init__(self):
         self.config = None
         self.config_file = None
-        self.client_id = 'cfb799e8647a4ad4b5767f6ef17b59ca'
-        self.client_secret = '45779f45eefd41328018232e4fe871b0'
+        self.client_id = 
+        self.client_secret = 
         self.access_token = None
         self.refresh_token = None
         self.act_id = None
