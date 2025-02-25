@@ -146,6 +146,13 @@ class AmzApi(object):
                     r = self.make_request(url, method='GET',
                                           headers=self.headers,
                                           json_response_key='response')
+                    if 'message' in self.r.json():
+                        message = self.r.json()['message']
+                        if 'authorization error(s)' in message:
+                            logging.warning(
+                                'Authorization error, check permissions: {}'
+                                .format(self.r.text))
+                            return False
                     profile = [x for x in r.json()['response'] if
                                self.advertiser_id in x['advertiserId']]
                     if profile:
@@ -520,6 +527,10 @@ class AmzApi(object):
         return self.r
 
     def request_error(self):
+        if 'message' in self.r.json():
+            message = self.r.json()['message']
+            if 'authorization error(s)' in message:
+                return
         logging.warning('Unknown error: {}'.format(self.r.text))
         sys.exit(0)
 
