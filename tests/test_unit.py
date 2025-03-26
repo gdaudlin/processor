@@ -191,10 +191,10 @@ class TestApis:
         return file_name, json_data
 
     def test_twapi_auth(self, tmp_path_factory):
-        config_file = ''
-        username = ''
-        password = ''
+        username = 'gdaudlintest'
+        password = 'March231998'
         api = twapi.TwApi()
+        config_file = api.default_config
         if config_file:
             api.input_config(config_file)
             api.authenticate_account(username=username,

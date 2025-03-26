@@ -91,6 +91,7 @@ user_fields = ['id', 'name', 'screen_name', 'location', 'description',
 class TwApi(object):
     def __init__(self):
         self.df = pd.DataFrame()
+        self.default_config = 'twconfig.json'
         self.configfile = None
         self.config = None
         self.consumer_key = None
@@ -571,9 +572,7 @@ class TwApi(object):
                 return timezone
         self.authenticate_accounts()
         timezone = self.get_account_timezone()
-        if timezone:
-            return timezone
-        return False
+        return timezone
 
     @staticmethod
     def get_passwords_df():
@@ -587,25 +586,26 @@ class TwApi(object):
         df = df.dropna(how='all')
         return df
 
-    @staticmethod
-    def get_client_name():
+    def get_client_name(self):
         const_config = os.path.join(utl.config_path, dctc.filename_con_config)
         df = pd.read_csv(const_config)
         client_name = (
             df.loc[df[dctc.DICT_COL_NAME] == dctc.CLI,
             dctc.DICT_COL_VALUE].values[0])
-        client_name = client_name.lower()
-        client_name = client_name.replace(' ', '')
+        client_name = self.unify_string(client_name)
         return client_name
 
     def find_password(self):
         df = self.get_passwords_df()
         client_name = self.get_client_name()
-        df['Client'] = df['Client'].astype(str).str.lower()
-        df['Client'] = df['Client'].astype(str).str.replace(' ','')
+        df['Client'] = df['Client'].apply(self.unify_string)
         client_match = df.loc[df['Client'] == client_name]
         password_df = client_match[['Username','Password']]
         return password_df
+
+    @staticmethod
+    def unify_string(string):
+        return str(string).lower().replace(' ', '')
 
     def authenticate_accounts(self):
         """
