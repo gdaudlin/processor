@@ -105,28 +105,32 @@ class DbApi(object):
                                 .total_seconds() * 1000)
         self.end_time = round((ed - dt.datetime.utcfromtimestamp(0))
                               .total_seconds() * 1000)
-        if fields and 'YOUTUBE' in fields:
-            self.default_groups = [
-                'FILTER_DATE',
-                'FILTER_TRUEVIEW_AD_GROUP',
-                'FILTER_TRUEVIEW_AD',
-                'FILTER_TRUEVIEW_AD_GROUP_ID']
-            self.default_metrics = [
-                'METRIC_TRUEVIEW_VIEWS',
-                'METRIC_CLICKS',
-                'METRIC_IMPRESSIONS',
-                'METRIC_REVENUE_USD',
-                'METRIC_RICH_MEDIA_VIDEO_FIRST_QUARTILE_COMPLETES',
-                'METRIC_RICH_MEDIA_VIDEO_MIDPOINTS',
-                'METRIC_RICH_MEDIA_VIDEO_THIRD_QUARTILE_COMPLETES',
-                'METRIC_RICH_MEDIA_VIDEO_COMPLETIONS']
-            self.query_type = 'YOUTUBE'
         if fields and fields != ['nan']:
             self.default_metrics += [
                 'METRIC_ACTIVE_VIEW_MEASURABLE_IMPRESSIONS',
                 'METRIC_ACTIVE_VIEW_VIEWABLE_IMPRESSIONS',
                 'METRIC_ACTIVE_VIEW_UNVIEWABLE_IMPRESSIONS'
             ]
+            for field in fields:
+                if field == 'YOUTUBE':
+                    self.default_groups = [
+                        'FILTER_DATE',
+                        'FILTER_TRUEVIEW_AD_GROUP',
+                        'FILTER_TRUEVIEW_AD',
+                        'FILTER_TRUEVIEW_AD_GROUP_ID']
+                    self.default_metrics = [
+                        'METRIC_TRUEVIEW_VIEWS',
+                        'METRIC_CLICKS',
+                        'METRIC_IMPRESSIONS',
+                        'METRIC_REVENUE_USD',
+                        'METRIC_RICH_MEDIA_VIDEO_FIRST_QUARTILE_COMPLETES',
+                        'METRIC_RICH_MEDIA_VIDEO_MIDPOINTS',
+                        'METRIC_RICH_MEDIA_VIDEO_THIRD_QUARTILE_COMPLETES',
+                        'METRIC_RICH_MEDIA_VIDEO_COMPLETIONS',
+                        'METRIC_ACTIVE_VIEW_MEASURABLE_IMPRESSIONS',
+                        'METRIC_ACTIVE_VIEW_VIEWABLE_IMPRESSIONS',
+                        'METRIC_ACTIVE_VIEW_UNVIEWABLE_IMPRESSIONS']
+                    self.query_type = 'YOUTUBE'
 
     def refresh_client_token(self, extra):
         token = None
