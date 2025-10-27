@@ -24,7 +24,7 @@ class IasApi(object):
 
     dimensions = ['Teams', 'Campaigns', 'Media partners', 'Placements', 'Date']
 
-    def __init__(self, headless=True):
+    def __init__(self, headless=False):
         self.headless = headless
         self.sw = None
         self.browser = None
