@@ -798,6 +798,9 @@ class DataSource(object):
         df = utl.apply_rules(df, self.vm_rules, utl.POST, **self.p)
         return df
 
+    def auto_xbox_adjustments(self, df):
+        return df
+
     def import_data(self):
         self.df = self.get_raw_df()
         if self.df is None or self.df.empty:

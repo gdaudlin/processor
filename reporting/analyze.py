@@ -113,6 +113,16 @@ class Analyze(object):
             CheckDoubleCounting, GetPacingAnalysis, GetDailyDelivery,
             GetServingAlerts, GetDailyPacingAlerts, CheckPackageCapping,
             CheckAdwordsSplit, CheckLive]
+        self.sheet_rules = {
+            "media_delivery": {
+                "required": ["media"],
+                "optional": ["delivery", "raw", "data"]
+            },
+            "conversion_data": {
+                "required": ["conversion"],
+                "optional": ["raw", "data"]
+            }
+        }
         if self.df.empty and self.file_name:
             self.load_df_from_file()
         if self.load_chat:
@@ -912,7 +922,31 @@ class Analyze(object):
         return cd, clean_functions, c_cols
 
     @staticmethod
-    def check_sheet_names(tds, sheet_names):
+    def normalize(text):
+        return re.sub(r"[^a-z0-9 ]", "", text.lower())
+
+    def match_sheet(self, sheet_names, rule):
+        best_match = None
+        best_score = 0
+        for sheet in sheet_names:
+            normalized = self.normalize(sheet)
+            tokens = normalized.split()
+            if not all(req in tokens for req in rule['required']):
+                continue
+            score = sum(opt in tokens for opt in rule.get('optional, []'))
+            score += len(tokens) * 0.01
+            if score > best_score:
+                best_score = score
+                best_match = sheet
+        return best_match
+
+    def resolve_required_sheets(self, sheet_lists):
+        resolved = {}
+        for key, rule in self.sheet_rules.items():
+            resolved[key] = self.match_sheet(sheet_lists, rule)
+        return resolved
+
+    def check_sheet_names(self, tds, sheet_names):
         missing_sheets = []
         try:
             xl = pd.read_excel(tds.p[vmc.filename], None)
@@ -920,6 +954,7 @@ class Analyze(object):
             logging.warning(e)
             return missing_sheets
         sheet_lists = list(xl.keys())
+        resolved = self.resolve_required_sheets(sheet_lists)
         for sheet_name in sheet_names:
             if sheet_name not in sheet_lists:
                 missing_sheets.append(sheet_name)
@@ -1014,6 +1049,7 @@ class Analyze(object):
             cd = self.check_raw_file_against_plan_net(df, cd, cds_name)
             cds.df = df
         self.write_raw_file_dict(vk, cd)
+        return cd
 
     def find_missing_serving(self):
         groups = [vmc.vendorkey, dctc.SRV, dctc.AM, dctc.PN]

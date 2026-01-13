@@ -1132,6 +1132,12 @@ class TestAnalyze:
         assert df.equals(match_df)
         """
 
+    def test_compare_rawfiles(self):
+        vk = 'API_RawfileXbox'
+        aly = az.Analyze(df=pd.DataFrame(), matrix=vm.VendorMatrix())
+        crf = aly.compare_raw_files(vk)
+        assert None
+
     @pytest.fixture
     def setup_autodict_files(self):
         """
