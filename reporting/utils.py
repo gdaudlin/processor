@@ -612,11 +612,13 @@ class SeleniumWrapper(object):
             zip_ref.extractall(self.driver_path)
         os.remove(file_name)
         logging.info(f"Downloaded ChromeDriver version {version}")
-        destination = 'C:/Users/gdaudlin/PycharmProjects/processor/.venvpy312/Scripts'
+        """
+        destination = 'C:/Windows/chromedriver.exe'
         file_name = os.path.join(
             self.driver_path, file_name.replace('.zip', ''),
             file_name.replace('-win64.zip', '.exe'))
         shutil.move(file_name, destination)
+        """
 
     @staticmethod
     def get_random_user_agent():
@@ -662,7 +664,7 @@ class SeleniumWrapper(object):
             co.add_experimental_option("mobileEmulation", mobile_emulation)
         try:
             browser = wd.Chrome(options=co)
-        except (ex.SessionNotCreatedException, FileNotFoundError, ex.WebDriverException) as e:
+        except (ex.SessionNotCreatedException, FileNotFoundError) as e:
             logging.warning(e)
             chrome_version = self.get_chrome_version()
             driver_version = self.get_chromedriver_version(chrome_version)

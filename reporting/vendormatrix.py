@@ -624,7 +624,8 @@ def full_placement_creation(df, key, full_col, full_place_cols):
             if col in df.columns:
                 campaign_name_check = ~df[col].str.match(r'(?i)^pre-launch$')
                 df.loc[campaign_name_check, col] = df.loc[
-                    campaign_name_check, col].str.replace(' - ', '_', regex=True).replace('-', '_', regex=True)
+                    campaign_name_check, col].str.replace(
+                    ' - ', '_',regex=True).replace('-', '_', regex=True)
         if col not in df:
             msg = '{} was not in {}.  It was not included in {}'.format(
                 col, key, dctc.FPN)
