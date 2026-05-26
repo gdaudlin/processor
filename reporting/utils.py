@@ -988,17 +988,27 @@ class SeleniumWrapper(object):
         browser a 100ms polling window for cells that transition into
         editable inputs asynchronously after a click.
         """
+        scroll_js = (
+            "arguments[0].scrollIntoView({block:'center'});"
+            "const r=arguments[0].getBoundingClientRect();"
+            "const tb=parseFloat(getComputedStyle(document.documentElement)"
+            ".getPropertyValue('--lq-topbar-h'))||48;"
+            "if(r.top<tb+8)window.scrollBy(0,r.top-tb-12);")
         for attempt in range(attempts):
             try:
                 elem = self.browser.find_element(By.ID, elem_id)
-                self.browser.execute_script(
-                    "arguments[0].scrollIntoView({block:'center'});", elem)
+                self.browser.execute_script(scroll_js, elem)
                 elem.clear()
                 return
             except (ex.ElementNotInteractableException,
                     ex.StaleElementReferenceException):
                 if attempt == attempts - 1:
-                    raise
+                    self.browser.execute_script(
+                        "arguments[0].value='';"
+                        "['input','change'].forEach(t=>arguments[0]"
+                        ".dispatchEvent(new Event(t,{bubbles:true})));",
+                        elem)
+                    return
                 time.sleep(sleep_time)
 
     def send_keys_wrapper(self, elem, value, elem_xpath=''):
@@ -1419,6 +1429,27 @@ class SeleniumWrapper(object):
         return poll_until_true(
             self.check_app_alert, {'key_terms': key_terms}, attempts,
             sleep, exception_msg=exception_msg)
+
+    def search_liquid_table(self, table_name, search_val=None, submit_id=''):
+        """
+        Clears and/or enters new value into the search bar of a liquid table.
+
+        :param table_name: Name of liquid table to search
+        :param search_val: Value to enter into the search bar after clearing it,
+            if any
+        :param submit_id: ID of HTML element to click after the search bar has
+            been modified, if any (e.x. the id of a row to open/ reveal the
+            hidden row of)
+
+        """
+        search_id = 'tableSearchInput{}Table'.format(table_name)
+        search_elem = self.browser.find_element_by_id(search_id)
+        search_elem.clear()
+        if search_val:
+            self.submit_form(form_names=[search_id], submit_id=submit_id,
+                             test_name=search_val)
+        else:
+            search_elem.send_keys(Keys.ENTER)
 
 
 def copy_file(old_file, new_file, attempt=1, max_attempts=100, sleep=60):

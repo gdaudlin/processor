@@ -135,6 +135,42 @@ class GsApi(object):
         df = self.get_data()
         return df
 
+    def create_spreadsheet(self, title=None):
+        """Create a new Google Spreadsheet via the Sheets API.
+        Returns the new spreadsheet id; caller is responsible for
+        sharing via `add_permissions`."""
+        logging.info('Creating GSheet: {}'.format(title))
+        body = {'properties': {'title': title or 'Untitled spreadsheet'}}
+        response = self.client.post(url=self.sheets_url, json=body)
+        response = response.json()
+        spreadsheet_id = response.get('spreadsheetId')
+        if spreadsheet_id:
+            self.sheet_id = spreadsheet_id
+        return spreadsheet_id
+
+    def write_values(self, spreadsheet_id, range_, values):
+        """Write a 2D list of values into the given A1 range. Uses
+        USER_ENTERED so formula-like cells render naturally."""
+        url = '{}/{}/values/{}'.format(
+            self.sheets_url, spreadsheet_id, range_)
+        params = {'valueInputOption': 'USER_ENTERED'}
+        body = {'values': values}
+        response = self.client.put(url=url, params=params, json=body)
+        return response
+
+    def batch_update(self, spreadsheet_id, requests):
+        """POST a list of Sheets requests (repeatCell, mergeCells,
+        updateBorders, ...) to spreadsheets.batchUpdate."""
+        if not requests:
+            return None
+        url = f'{self.sheets_url}/{spreadsheet_id}:batchUpdate'
+        return self.client.post(url=url, json={'requests': requests})
+
+    @staticmethod
+    def spreadsheet_url(spreadsheet_id):
+        return 'https://docs.google.com/spreadsheets/d/{}/edit'.format(
+            spreadsheet_id)
+
     def create_presentation(self, presentation_name=None):
         logging.info('Creating GSlides Presentation: {}'.format(
             presentation_name))

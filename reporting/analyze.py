@@ -99,7 +99,8 @@ class Analyze(object):
     def __init__(self, df=pd.DataFrame(), file_name=None, matrix=None,
                  load_chat=False, chat_path=utl.config_path, llm_url='',
                  llm_model='', llm_instructions='', previous_messages=None,
-                 transformer=None, transformer_dict=None):
+                 transformer=None, transformer_dict=None,
+                 write_authority=None):
         self.analysis_dict = []
         self.df = df
         self.file_name = file_name
@@ -128,7 +129,8 @@ class Analyze(object):
                 llm_instructions=self.llm_instructions,
                 previous_messages=self.previous_messages,
                 transformer=transformer,
-                transformer_dict=transformer_dict)
+                transformer_dict=transformer_dict,
+                write_authority=write_authority)
 
     def get_base_analysis_dict_format(self):
         analysis_dict_format = {
@@ -1999,7 +2001,7 @@ class FindPlacementNameCol(AnalyzeBase):
         non_numeric_cols = df.select_dtypes(exclude=['number']).columns.tolist()
         if not non_numeric_cols:
             return result_df
-        vendor_list_lower = {x.lower() for x in
+        vendor_list_lower = {str(x).lower() for x in
                              CheckAutoDictOrder.get_vendor_list()}
         cols = []
         first_row = df.iloc[0]
@@ -3485,7 +3487,7 @@ class AliChat(object):
     openai_found = 'Here is the openai gpt response: '
     openai_msg = ('I had trouble understanding but the '
                   'openai gpt response is:')
-    found_model_msg = 'Links are provided below.  '
+    found_model_msg = ''
     create_success_msg = 'The object has been successfully created.  '
     ex_prompt_wrap = "<br>Ex. prompt: <div class='examplePrompt'>"
     opening_phrases = [
@@ -3520,7 +3522,7 @@ class AliChat(object):
     def __init__(self, config_name='openai.json', config_path='reporting',
                  llm_url='', llm_model='', llm_instructions='',
                  previous_messages=None, transformer=None,
-                 transformer_dict=None):
+                 transformer_dict=None, write_authority=None):
         self.config_name = config_name
         self.config_path = config_path
         self.db = None
@@ -3537,6 +3539,35 @@ class AliChat(object):
         self.call_llm = False
         self.transformer = transformer
         self.transformer_dict = transformer_dict or {}
+        self.write_authority = write_authority
+
+    def _propose_column_write(self, cur_model, column, new_val):
+        """setattr+commit a heuristic column write, gated by the
+        optional write_authority. Returns True when the write
+        proceeded, False when the authority deferred it; deferred
+        writes must not be reflected in the response string."""
+        if self.write_authority:
+            proceed = self.write_authority(
+                op='column_write', model=cur_model,
+                column=column, new_val=new_val,
+                existing_val=getattr(cur_model, column, None))
+            if not proceed:
+                return False
+        setattr(cur_model, column, new_val)
+        self.db.session.commit()
+        return True
+
+    def _propose_create(self, new_model, parent=None,
+                        op='create'):
+        """Commit a heuristic create. The write_authority is
+        invoked for audit logging only — net-new creates always
+        proceed."""
+        if self.write_authority is not None:
+            self.write_authority(
+                op=op, model=new_model, parent=parent)
+        self.db.session.add(new_model)
+        self.db.session.commit()
+        return True
 
     @staticmethod
     def load_config(config_name='openai.json', config_path='reporting'):
@@ -3787,17 +3818,30 @@ class AliChat(object):
                         f"Skipping unparseable LLM chunk:"
                         f" {raw_line[:200]}")
                     continue
-                delta = data.get("choices", [{}])[0].get("delta", {})
+                choice = data.get("choices", [{}])[0]
+                delta = choice.get("delta", {})
+                finish_reason = choice.get("finish_reason")
                 if delta.get("reasoning_content"):
                     yield {"type": "thinking",
                            "delta": delta["reasoning_content"]}
                 if delta.get("content"):
                     yield {"type": "response", "delta": delta["content"]}
+                if delta.get("tool_calls"):
+                    yield {
+                        "type": "tool_call_delta",
+                        "delta": delta["tool_calls"],
+                    }
+                if finish_reason:
+                    yield {
+                        "type": "finish",
+                        "delta": finish_reason,
+                    }
 
     def get_llm_response(self, context, user_query, mode='answer',
                          instructions='', previous_messages=None,
                          stream=False, timeout=120, temperature=0.4,
-                         source_context=None):
+                         source_context=None, tools=None,
+                         tool_choice='auto', extra_messages=None):
         """
         Passes the context to the llm url to better answer the question
 
@@ -3842,12 +3886,17 @@ class AliChat(object):
                 f"Relevant source code:\n{source_context}")
         user_content = '\n\n'.join(parts)
         messages.append({"role": "user", "content": user_content})
+        if extra_messages:
+            messages.extend(extra_messages)
         body = {
             "model": self.llm_model,
             "messages": messages,
             "stream": stream,
             "temperature": temperature,
         }
+        if tools:
+            body['tools'] = tools
+            body['tool_choice'] = tool_choice
         if stream:
             return self.llm_request_generator(body)
         else:
@@ -3944,6 +3993,8 @@ class AliChat(object):
         db_model_child = cur_model.get_children()
         if not db_model_child:
             return response
+        if not hasattr(db_model_child, 'get_name_list'):
+            return response
         cur_children = cur_model.get_current_children()
         child_list = db_model_child.get_name_list()
         child_name = [x for x in words if x in child_list]
@@ -3952,8 +4003,8 @@ class AliChat(object):
         if child_name:
             new_child = db_model_child()
             new_child.set_from_form({'name': child_name[0]}, cur_model)
-            self.db.session.add(new_child)
-            self.db.session.commit()
+            self._propose_create(
+                new_child, parent=cur_model, op='create_child')
             msg = 'The {} is named {}.  '.format(
                 db_model_child.__name__, child_name[0])
             self.check_db_model_col(db_model_child, words, new_child)
@@ -3965,6 +4016,8 @@ class AliChat(object):
             new_child = new_child[0]
         db_model_g_child = new_child.get_children()
         cur_g_children = new_child.get_current_children()
+        if not db_model_g_child:
+            return response
         partner_list, partner_type_list = db_model_g_child.get_name_list()
         p_list = utl.get_dict_values_from_list(words, partner_list, True)
         part_add_msg = '{}(s) added '.format(db_model_g_child.__name__)
@@ -3992,8 +4045,8 @@ class AliChat(object):
                 g_child['total_budget'] = cost
                 new_g_child = db_model_g_child()
                 new_g_child.set_from_form(g_child, new_child)
-                self.db.session.add(new_g_child)
-                self.db.session.commit()
+                self._propose_create(
+                    new_g_child, parent=new_child, op='create_child')
                 if part_add_msg not in response:
                     response += part_add_msg
                 response += '{} ({}) '.format(g_child_name, cost)
@@ -4083,8 +4136,8 @@ class AliChat(object):
                 name = new_model.get_first_unique_name(name[0])
                 new_model.set_from_form({'name': name}, parent_model,
                                         self.current_user.id)
-                self.db.session.add(new_model)
-                self.db.session.commit()
+                self._propose_create(
+                    new_model, parent=parent_model, op='create')
             response = self.check_db_model_col(db_model, words, new_model)
             response += self.create_db_model_children(new_model, words)
             response = '{}{}'.format(self.create_success_msg, response)
@@ -4140,11 +4193,11 @@ class AliChat(object):
                 new_val = utl.get_next_number_from_list(
                     words, k, cur_model.name, last_instance=True)
             if new_val:
-                setattr(cur_model, k, new_val)
-                self.db.session.commit()
-                response += 'The {} for {} was changed to {}.  '.format(
-                    k, cur_model.name, new_val)
+                applied = self._propose_column_write(cur_model, k, new_val)
                 words = [x for x in words if x not in in_list]
+                if applied:
+                    response += 'The {} for {} was changed to {}.  '.format(
+                        k, cur_model.name, new_val)
         return response
 
     def check_children_for_edit(self, cur_model, words):
@@ -4179,6 +4232,8 @@ class AliChat(object):
 
     def edit_db_model(self, db_model, words, model_ids):
         response = ''
+        if not getattr(db_model, 'chat_editable', False):
+            return response
         edit_words = ['change', 'edit', 'adjust', 'alter', 'add']
         is_edit = utl.is_list_in_list(edit_words, words)
         if is_edit:
@@ -4236,17 +4291,70 @@ class AliChat(object):
         stop_words = list(nltk.corpus.stopwords.words('english'))
         return stop_words
 
+    @staticmethod
+    def _format_page_context_line(page_context):
+        """Build the single-sentence system-prompt addendum.
+
+        Mirrors ``app.features.ali.page_context``'s formatter so the
+        submodule has no Flask-layer dependency.
+        """
+        if not page_context:
+            return ''
+        object_type = page_context.get('object_type')
+        if not object_type:
+            return ''
+        object_id = page_context.get('object_id')
+        object_name = page_context.get('object_name')
+        sub_view = page_context.get('sub_view')
+        name_clause = (
+            " '{}'".format(object_name) if object_name else '')
+        id_clause = (
+            ' (id {})'.format(object_id) if object_id else '')
+        sub_clause = (
+            ', {} tab'.format(sub_view) if sub_view else '')
+        return (
+            'The user is currently viewing '
+            '{}{}{}{}.'.format(
+                object_type, name_clause, id_clause, sub_clause))
+
+    @staticmethod
+    def _resolve_page_context_model(page_context, models_to_search):
+        """Match page-context object_type to a model class.
+
+        Returns ``(model_class, object_id)`` if the page context
+        names an object whose class is in ``models_to_search``,
+        else ``None``.
+        """
+        if not page_context or not models_to_search:
+            return None
+        object_type = (page_context.get('object_type') or '').lower()
+        object_id = page_context.get('object_id')
+        if not object_type or not object_id:
+            return None
+        for model in models_to_search:
+            if model.__name__.lower() == object_type:
+                return model, object_id
+        return None
+
     def get_response(self, message, models_to_search=None, db=None,
                      current_user=None, is_question=False,
                      file_map=None, base_path=None,
-                     doc_files=None, area_keywords=None):
+                     doc_files=None, area_keywords=None,
+                     page_context=None):
         self.db = db
         self.current_user = current_user
         self.models_to_search = models_to_search
         self.message = message
+        self.page_context = page_context
         ticket_offered = None
         if not self.stop_words:
             self.stop_words = self.get_stop_words()
+        if page_context:
+            line = self._format_page_context_line(page_context)
+            if line:
+                base = self.llm_instructions or ''
+                self.llm_instructions = (
+                    f'{base}\n\n{line}' if base else line)
         response, html_response = self.check_if_openai_message(message)
         intent_dict = self.intent.classify_intent(message)
         if not is_question:
@@ -4256,6 +4364,24 @@ class AliChat(object):
                 x for x in models_to_search if hasattr(x, 'llm_summary')]
         matched_models = []
         self.matched_models = matched_models
+        pc_resolved = self._resolve_page_context_model(
+            page_context, models_to_search)
+        if pc_resolved and not response and not is_question:
+            pc_model, pc_id = pc_resolved
+            try:
+                words = self.remove_stop_words_from_message(
+                    message, pc_model)
+                response, html_response = (
+                    self.search_db_model_from_ids(
+                        pc_model, words, {pc_id: 1}))
+                if response:
+                    matched_models.append(pc_model)
+                    if (self.llm_url and
+                            hasattr(pc_model, 'llm_summary')):
+                        self.call_llm = True
+            except Exception:
+                response = ''
+                html_response = ''
         if not response and models_to_search and not is_question:
             for db_model in models_to_search:
                 in_message = self.db_model_name_in_message(message, db_model)
@@ -4293,22 +4419,23 @@ class AliChat(object):
                 self.call_llm = False
                 ticket_offered = 'direct'
         elif not response:
-            guidance_searched = [
-                m for m in models_to_search
-                if m.__name__ in ali_tic.GUIDANCE_MODELS]
-            if guidance_searched:
-                names = ', '.join(
-                    m.__name__ for m in guidance_searched)
-                response = (
-                    'Could not find matching docs in {}. '
-                    'Try browsing the tutorials or '
-                    'walkthroughs pages directly. '
-                    'Will attempt to answer.'
-                ).format(names)
-            else:
-                response = (
-                    'Could not find any relevant docs, '
-                    'but will attempt to answer.')
+            if ali_tic.is_doc_style_prompt(message):
+                guidance_searched = [
+                    m for m in models_to_search
+                    if m.__name__ in ali_tic.GUIDANCE_MODELS]
+                if guidance_searched:
+                    names = ', '.join(
+                        m.__name__ for m in guidance_searched)
+                    response = (
+                        'Could not find matching docs in '
+                        '{}. Try browsing the tutorials or '
+                        'walkthroughs pages directly. '
+                        'Will attempt to answer.'
+                    ).format(names)
+                else:
+                    response = (
+                        'Could not find any relevant docs, '
+                        'but will attempt to answer.')
             html_response = ''
             self.call_llm = True
         source_context = None
@@ -4433,14 +4560,8 @@ class AliChat(object):
         return response
 
     def polish_response(self, response):
-        """
-        Combine multiple formatting functions into one 'polish' step.
-
-        :param response: Current raw response as text.
-        :return: Text that has been edited
-        """
-        # response = self.add_bullet_response(response)
-        response = self.add_polite_flair(response)
+        """Pass-through. Flair wrappers are disabled — they
+        fought the system prompt's concise/confident rule."""
         return response
 
 
