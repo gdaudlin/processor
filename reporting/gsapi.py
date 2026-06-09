@@ -28,9 +28,15 @@ class GsApi(object):
     text_format = 'NORMAL_TEXT'
     screenshot_dir = os.path.join('screenshots', 'charts/')
     default_config_file_name = 'gsapi.json'
+    default_config = 'gsapi_screenshots.json'
+    required_scopes = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive',
+        'https://www.googleapis.com/auth/presentations',
+        'https://www.googleapis.com/auth/documents',
+    ]
 
     def __init__(self):
-        self.default_config = "gsapi_screenshots.json"
         self.config = None
         self.config_file = None
         self.client_id = None
@@ -44,6 +50,7 @@ class GsApi(object):
         self.df = pd.DataFrame()
         self.r = None
         self.google_doc = False
+        self.on_token_refresh = None
         self.parse_response = self.parse_sheets_response
 
     def input_config(self, config):
@@ -72,6 +79,20 @@ class GsApi(object):
         self.config_list = [self.config, self.client_id, self.client_secret,
                             self.refresh_token, self.refresh_url, self.sheet_id]
 
+    def load_config_dict(self, config):
+        """Populate credentials from an in-memory dict, bypassing the
+        CWD-relative config file load (used by the app-layer vault)."""
+        self.config = config
+        self.client_id = config['client_id']
+        self.client_secret = config['client_secret']
+        self.access_token = config['access_token']
+        self.refresh_token = config['refresh_token']
+        self.refresh_url = config['refresh_url']
+        self.sheet_id = config.get('sheet_id', '')
+        self.config_list = [self.config, self.client_id,
+                            self.client_secret, self.refresh_token,
+                            self.refresh_url]
+
     def check_config(self):
         for item in self.config_list:
             if item == '':
@@ -97,6 +118,8 @@ class GsApi(object):
         self.client = OAuth2Session(self.client_id, token=token)
         token = self.client.refresh_token(self.refresh_url, **extra)
         self.client = OAuth2Session(self.client_id, token=token)
+        if self.on_token_refresh:
+            self.on_token_refresh(token)
 
     def create_url(self):
         if self.google_doc:
@@ -183,21 +206,44 @@ class GsApi(object):
         self.add_permissions(presentation_id)
         return presentation_id
 
-    def add_permissions(self, presentation_id, domain="liquidadvertising.com"):
-        url = self.files_url + "/" + presentation_id + "/permissions"
-        body = {
+    def _create_permission(self, file_id, body, params=None):
+        """POST a single Drive permission and return the response.
+
+        Shared by the domain-wide and per-user share helpers so the
+        request + warning-log path lives in one place."""
+        url = '{}/{}/permissions'.format(self.files_url, file_id)
+        response = self.client.post(
+            url=url, params=params or {}, json=body)
+        if response.status_code not in (200, 204):
+            logging.warning(
+                'Failed to set permission on {}: {} (Status {})'.format(
+                    file_id, response.text, response.status_code))
+        return response
+
+    def add_permissions(self, presentation_id,
+                        domain="liquidadvertising.com"):
+        """Share a Drive file with an entire Workspace domain."""
+        return self._create_permission(presentation_id, {
             "role": "writer",
             "type": "domain",
             "domain": domain,
-            "allowFileDiscovery": True
-        }
-        response = self.client.post(url=url, json=body)
-        if response.status_code not in (200, 204):
-            logging.warning(
-                'Failed to share {} with domain {}: {} (Status {})'.format(
-                    presentation_id, domain, response.text,
-                    response.status_code))
-        return response
+            "allowFileDiscovery": True,
+        })
+
+    def add_user_permission(self, file_id, email, role="writer",
+                            notify=False):
+        """Share a Drive file with a single Google account.
+
+        More reliable than domain sharing: a ``type:"user"`` grant to
+        a Workspace member does not depend on the admin's domain-wide
+        sharing policy, so the recipient keeps access even when
+        whole-domain sharing is refused. ``notify=False`` skips the
+        "shared with you" email since the caller usually opens the
+        file itself."""
+        return self._create_permission(
+            file_id,
+            {"role": role, "type": "user", "emailAddress": email},
+            {"sendNotificationEmail": "true" if notify else "false"})
 
     def add_image_slide(self, presentation_id=None, ad_id=None,
                         image_url=None):
