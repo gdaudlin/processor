@@ -1093,3 +1093,52 @@ class StoreAsset(Base):
         Boolean, comment='True when the digest differs from this '
                          "game's previous stored digest for the same "
                          'kind; False on the first observation.')
+
+
+class CriticReview(Base):
+    """One OpenCritic outlet review per game — the rows behind
+    ``critic_score``'s aggregates, keyed on OpenCritic's own review id
+    so a re-fetch updates in place."""
+    __tablename__ = 'critic_review'
+    __table_args__ = (
+        UniqueConstraint('review_id', name='uq_critic_review_id'),
+        Index('ix_critic_review_gameid', 'gameid'),
+        Index('ix_critic_review_published', 'published_date'),
+        {'schema': 'games',
+         'comment': 'Per-outlet OpenCritic reviews per game - the '
+                    'distribution behind critic_score. Sparse by '
+                    'design: a title\'s reviews land when the review '
+                    'call budget reaches it, newest first and '
+                    'incremental, so absence means "not fetched yet", '
+                    'never "unreviewed", and a title past the page '
+                    'cap holds its newest reviews rather than the '
+                    'whole set. score is NULL for an unscored '
+                    'review.'},
+    )
+
+    criticreviewid = Column(BigIntPk, primary_key=True)
+    gameid = Column(BigInteger, ForeignKey('games.game.gameid'),
+                    nullable=False)
+    opencritic_id = Column(
+        BigInteger, nullable=False,
+        comment='OpenCritic game id the review was fetched under.')
+    review_id = Column(
+        Text, nullable=False,
+        comment="OpenCritic's own review id, kept as text so an "
+                'id-format change never drops rows.')
+    outlet = Column(Text, comment='Outlet name as published.')
+    outlet_id = Column(
+        BigInteger, comment='OpenCritic outlet id; NULL when absent.')
+    author = Column(
+        Text, comment='Author names joined with ", "; NULL when absent.')
+    score = Column(
+        Numeric, comment='Score on the 0-100 scale; NULL for an '
+                         'unscored review.')
+    published_date = Column(
+        Date, comment='UTC date the review was published; NULL when '
+                      'absent.')
+    url = Column(Text, comment="The review on the outlet's site.")
+    fetched_at = Column(
+        DateTime, nullable=False,
+        comment='Naive UTC; the last sweep that touched the row - the '
+                "lane's rotation watermark (max per gameid).")

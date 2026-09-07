@@ -3237,6 +3237,44 @@ class TestGamesDb:
         assert row.digest == 'def' and row.changed is True
         assert row.item_count == 6
 
+    def test_critic_review_upsert_idempotent(self):
+        """A re-fetch restamps the row in place, and an unscored
+        review is legal."""
+        s = self._session()
+        game = gdb.upsert_game(s, 'Halo Infinite',
+                               registry_slug='halo-infinite')
+        key = {'review_id': '9001'}
+        stamp = dt.datetime(2026, 9, 4, 8, 0)
+        assert gdb.upsert_fact(
+            s, gmdl.CriticReview, key,
+            {'gameid': game.gameid, 'opencritic_id': 42,
+             'outlet': 'IGN', 'score': 90,
+             'published_date': dt.date(2026, 9, 1),
+             'fetched_at': stamp}) == 1
+        s.commit()
+        later = stamp + dt.timedelta(days=1)
+        assert gdb.upsert_fact(
+            s, gmdl.CriticReview, key,
+            {'score': None, 'fetched_at': later}) == 0
+        s.commit()
+        row = s.query(gmdl.CriticReview).one()
+        assert row.score is None and row.fetched_at == later
+        assert row.outlet == 'IGN' and row.gameid == game.gameid
+
+    def test_critic_review_id_unique_constraint(self):
+        """The natural key is OpenCritic's review id, so a second row
+        carrying it is a duplicate whatever game it claims."""
+        s = self._session()
+        game = gdb.upsert_game(s, 'Game A', opencritic_id=42)
+        s.commit()
+        fields = dict(gameid=game.gameid, opencritic_id=42,
+                      review_id='9001',
+                      fetched_at=dt.datetime(2026, 9, 4))
+        s.add(gmdl.CriticReview(**fields))
+        s.commit()
+        s.add(gmdl.CriticReview(**fields))
+        assert gdb.safe_commit(s, 'test') is False
+
     def test_store_asset_fields_shapes(self):
         assert gamesw.store_asset_fields(None) == []
         assert gamesw.store_asset_fields({}) == []
