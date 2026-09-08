@@ -1033,7 +1033,7 @@ class AmzApi(object):
             return self.df
         sd, ed = self.get_data_default_check(sd, ed, fields)
         v1_df = self.run_v1_report(sd, ed)
-        if v1_df:
+        if v1_df is not None:
             self.df = v1_df
             return self.df
         date_list = self.list_dates(sd, ed)
