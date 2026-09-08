@@ -214,6 +214,7 @@ class AmzApi(object):
         self.entity_id = None
         self.dsp_id = ''
         self.use_v1 = True
+        self.config_use_v1 = True
         self.v1_account_id = ''
         self.product_sheet_id = '1BIc9mreRHelaI8sXdnFm8eRW4kB3iJyN4w0BbcqIsjg'
 
@@ -254,6 +255,8 @@ class AmzApi(object):
                             self.refresh_token]
         if 'campaign_id' in config:
             self.campaign_id = config['campaign_id']
+        self.config_use_v1 = config.get('use_v1', True)
+        self.use_v1 = self.config_use_v1
 
     def check_config(self):
         for item in self.config_list:
@@ -895,14 +898,23 @@ class AmzApi(object):
         if not reports:
             return pd.DataFrame()
         df_list = []
+        performance_rows = 0
         for report in reports:
             report_df = self.rename_v1_columns(
                 self.check_v1_report_status(report['report_id']))
             logging.info('v1 {} report {} returned {} rows.'.format(
                 'conversion' if report['is_event'] else 'performance',
                 report['report_id'], len(report_df)))
+            if not report['is_event']:
+                performance_rows += len(report_df)
             if self.keep_v1_report(report_df, report):
                 df_list.append(report_df)
+        if not performance_rows:
+            logging.warning(
+                'The v1 performance report produced no rows, so the '
+                'conversion rows alone would report zero impressions '
+                'and zero spend.  Discarding the v1 result.')
+            return pd.DataFrame()
         df = self.merge_dataframes(df_list)
         self.log_v1_event_coverage(df)
         logging.info('v1 report returned {} rows.  Columns: {}'
@@ -981,6 +993,34 @@ class AmzApi(object):
             logging.warning('Report not made returning blank df.')
         return self.df
 
+    def run_v1_report(self, sd, ed):
+        """
+        Runs the v1 flow and says whether it answered the request.
+
+        :param sd: start date as a datetime
+        :param ed: end date as a datetime
+        :returns: dataframe when v1 answered, else None
+        """
+        if not self.use_v1 or not self.check_v1_supported():
+            return None
+        df = self.get_v1_data(sd, ed)
+        if df.empty:
+            logging.warning('Ads API v1 returned no rows, falling back to '
+                            'the v3 report flow.')
+            if self.include_conversions:
+                logging.warning(
+                    'The v3 flow has no conversion definition or off '
+                    'Amazon conversion fields, so that breakout will be '
+                    'missing from this pull.')
+            return None
+        row_count = len(df)
+        df = self.filter_df_on_campaign(df)
+        if df.empty:
+            logging.warning(
+                'The campaign filter {} removed all {} rows the v1 '
+                'report returned.'.format(self.campaign_id, row_count))
+        return df
+
     def get_data(self, sd=None, ed=None, fields=None):
         self.report_ids = []
         self.df = pd.DataFrame()
@@ -992,24 +1032,10 @@ class AmzApi(object):
         if not profile_found:
             return self.df
         sd, ed = self.get_data_default_check(sd, ed, fields)
-        if self.use_v1 and self.check_v1_supported():
-            self.df = self.get_v1_data(sd, ed)
-            if not self.df.empty:
-                row_count = len(self.df)
-                self.df = self.filter_df_on_campaign(self.df)
-                if self.df.empty:
-                    logging.warning(
-                        'The campaign filter {} removed all {} rows the '
-                        'v1 report returned.'.format(
-                            self.campaign_id, row_count))
-                return self.df
-            logging.warning('Ads API v1 returned no rows, falling back to '
-                            'the v3 report flow.')
-            if self.include_conversions:
-                logging.warning(
-                    'The v3 flow has no conversion definition or off '
-                    'Amazon conversion fields, so that breakout will be '
-                    'missing from this pull.')
+        v1_df = self.run_v1_report(sd, ed)
+        if v1_df:
+            self.df = v1_df
+            return self.df
         date_list = self.list_dates(sd, ed)
         report_ids = []
         self.purge_expired_cache(fresh_pull=self.fresh_pull)
