@@ -394,7 +394,7 @@ class TitleRank(Base):
 
 class TitleScore(Base):
     """Daily competitive-score snapshot — one row per tracked title per
-    day, persisting the brandtracker weighted z-scores and the
+    day, persisting the brandtracker dimension scores and the
     competitive league so trend history exists without a human opening
     the tab."""
     __tablename__ = 'title_score'
@@ -403,10 +403,11 @@ class TitleScore(Base):
                          name='uq_title_score_day'),
         Index('ix_title_score_gameid', 'gameid'),
         {'schema': 'games',
-         'comment': 'Daily competitive snapshot; brandtracker weighted '
-                    'z-scores + share-of-voice league per tracked '
-                    'title. Z-scores are relative to the tracked set '
-                    'on that day, not the whole market.'},
+         'comment': 'Daily competitive snapshot; brandtracker '
+                    'rank-normal dimension scores + share-of-voice '
+                    'league per tracked title. A score is a position '
+                    'within the set scored that day, not the whole '
+                    'market.'},
     )
 
     titlescoreid = Column(BigIntPk, primary_key=True)
@@ -428,7 +429,11 @@ class TitleScore(Base):
     influence = Column(Numeric)
     engagement = Column(Numeric)
     momentum = Column(Numeric)
-    composite = Column(Numeric, comment='Sum of the dimension z-scores.')
+    composite = Column(
+        Numeric, comment='Mean of the composite dimensions the title '
+                         'carries, each the weighted mean of its '
+                         'signals\' rank-normal scores, on a ±100 '
+                         'scale.')
     headline_metric = Column(
         Text, comment='Metric the current/prior/share columns read on.')
     current = Column(Numeric)
@@ -443,6 +448,15 @@ class TitleScore(Base):
                          'rows carrying different set_size values are '
                          'not directly comparable — the field widened '
                          'when the automated title universe landed.')
+    signals = Column(
+        Integer, comment='How many metrics the composite dimensions '
+                         'actually read — the evidence the score '
+                         'stands on. Under the kernel\'s minimum the '
+                         'title is thin: it keeps its number, ranks '
+                         'behind every fully scored title and sits the '
+                         'daily board out. NULL on rows scored before '
+                         'the column; Rescore Title Scores fills '
+                         'them.')
     satisfaction = Column(
         Numeric, comment='Weighted z-score of the reception signals '
                          '(Steam positive review share). Reported '
@@ -452,10 +466,11 @@ class TitleScore(Base):
         JSON().with_variant(JSONB, 'postgresql'),
         comment='Every metric behind the row\'s scores: {metric: '
                 '{value, prior, z, weight, dimension}} — the month '
-                'mean, the comparison month\'s mean, its z-score '
-                'against that day\'s field, the weight it carried and '
-                'the dimension it rode. Roughly 19 metrics per title '
-                'per day. NULL on rows scored before the column.')
+                'mean, the comparison month\'s mean, its rank-normal '
+                'score against that day\'s field, the weight it '
+                'carried and the dimension it rode. Roughly 19 metrics '
+                'per title per day. NULL on rows scored before the '
+                'column.')
 
 
 class GwiAffinity(Base):
@@ -907,3 +922,223 @@ class ReviewTheme(Base):
     computed_at = Column(
         DateTime, comment='Naive UTC; when derive wrote this row - '
                           'the recency column.')
+
+
+class CommunityPulse(Base):
+    """Intraday Twitch sample — one row per game per pulse slot.
+
+    ``community_snapshot.twitch_viewers`` is one point-in-time reading
+    a day; this table holds the intraday curve behind it. A slot is
+    the sample time truncated to the pulse interval, so a rerun inside
+    a slot updates in place instead of stacking rows, and
+    hours-watched derivations know the grain they average over."""
+    __tablename__ = 'community_pulse'
+    __table_args__ = (
+        UniqueConstraint('gameid', 'sampled_at',
+                         name='uq_community_pulse_slot'),
+        Index('ix_community_pulse_sampled', 'sampled_at'),
+        {'schema': 'games',
+         'comment': 'Intraday Twitch viewership samples per game. '
+                    'Sparse by design: a budgeted slice of the '
+                    'tracked pool per slot, so absence of a row is '
+                    '"not sampled", never "zero viewers".'},
+    )
+
+    communitypulseid = Column(BigIntPk, primary_key=True)
+    gameid = Column(BigInteger, ForeignKey('games.game.gameid'),
+                    nullable=False)
+    sampled_at = Column(
+        DateTime, nullable=False,
+        comment='Naive UTC slot start - the sample time truncated to '
+                'the pulse interval (4h at ship).')
+    twitch_viewers = Column(
+        Numeric, comment='Concurrent viewers on the title\'s Twitch '
+                         'category (Helix Get Streams, top pages '
+                         'summed) at sample time.')
+    twitch_channels = Column(
+        Numeric, comment='Live channels observed across the pages '
+                         'read - a floor when pagination stops early, '
+                         'not a census.')
+    sponsored_streams = Column(
+        Numeric, comment='Of the observed channels, those whose '
+                         'stream title carries a sponsorship token '
+                         '("sponsored" without "not sponsored", #ad, '
+                         '"paid partnership", ...). The token rule '
+                         'lives in the twitch_pulse lane.')
+
+
+class StreamFlag(Base):
+    """Evidence rows behind ``community_pulse.sponsored_streams`` —
+    the flagged streams themselves, capped per title per slot in the
+    lane so a big campaign cannot flood the table. Natural key
+    ``(gameid, sampled_at, channel)``: one row per channel per slot,
+    updated in place on a rerun."""
+    __tablename__ = 'stream_flag'
+    __table_args__ = (
+        UniqueConstraint('gameid', 'sampled_at', 'channel',
+                         name='uq_stream_flag_slot'),
+        Index('ix_stream_flag_gameid', 'gameid'),
+        Index('ix_stream_flag_sampled', 'sampled_at'),
+        {'schema': 'games',
+         'comment': 'Streams whose title matched a sponsorship token '
+                    'during a community_pulse sample. Capped '
+                    'per title per slot - evidence, not a census; '
+                    'counts live on community_pulse.'},
+    )
+
+    streamflagid = Column(BigIntPk, primary_key=True)
+    gameid = Column(BigInteger, ForeignKey('games.game.gameid'),
+                    nullable=False)
+    sampled_at = Column(
+        DateTime, nullable=False,
+        comment='Naive UTC slot start - same truncation as '
+                'community_pulse.sampled_at.')
+    channel = Column(Text, nullable=False,
+                     comment='Streamer login (user_login).')
+    title = Column(Text, comment='Stream title as observed.')
+    token = Column(Text, comment='The sponsorship token that matched.')
+    viewer_count = Column(
+        Numeric, comment='Viewers on the flagged stream at sample '
+                         'time.')
+
+
+class PriceSnapshot(Base):
+    """Steam list price per game per day — the sale-cycle fact.
+
+    Written by the appdetails lane from ``price_overview`` (one
+    region per run, ``cc=us`` at ship), so history accrues at the
+    lane's budgeted pace: a title is re-priced when its appdetails
+    turn comes around, not nightly. ``game_event.price`` (legacy
+    steapi path, final price only) is unrelated and left alone."""
+    __tablename__ = 'price_snapshot'
+    __table_args__ = (
+        UniqueConstraint('gameid', 'price_date',
+                         name='uq_price_snapshot_day'),
+        Index('ix_price_snapshot_date', 'price_date'),
+        {'schema': 'games',
+         'comment': 'Daily Steam price/discount state per game from '
+                    'appdetails price_overview, single region (US at '
+                    'ship). Sparse: a row lands when the appdetails '
+                    'budget reaches the title, so gaps mean "not '
+                    'checked", never "no price". Free titles carry '
+                    'no row (appdetails omits price_overview).'},
+    )
+
+    pricesnapshotid = Column(BigIntPk, primary_key=True)
+    gameid = Column(BigInteger, ForeignKey('games.game.gameid'),
+                    nullable=False)
+    price_date = Column(Date, nullable=False,
+                        comment='UTC ingest date.')
+    currency = Column(Text,
+                      comment='ISO currency code as returned '
+                              '(request is cc=us, so USD in '
+                              'practice).')
+    base_price = Column(
+        Numeric, comment='List price before discount '
+                         '(price_overview.initial / 100).')
+    final_price = Column(
+        Numeric, comment='Price after the current discount '
+                         '(price_overview.final / 100).')
+    discount_pct = Column(
+        Numeric, comment="Steam's own discount_percent (0 when not "
+                         'on sale).')
+
+
+class StoreAsset(Base):
+    """Steam storefront asset state per game per checked day — the
+    creative-refresh fact.
+
+    Each asset kind lands as a digest of its normalised content, and
+    ``changed`` says whether it differs from the title's previous
+    stored digest for that kind; a first observation is a baseline,
+    and a CDN cache-buster is stripped before hashing."""
+    __tablename__ = 'store_asset'
+    __table_args__ = (
+        UniqueConstraint('gameid', 'checked_at', 'asset_kind',
+                         name='uq_store_asset_day'),
+        Index('ix_store_asset_date', 'checked_at'),
+        {'schema': 'games',
+         'comment': 'Storefront asset digests per game per checked '
+                    'day from Steam appdetails (header image, '
+                    'screenshots, movies, short description). '
+                    'Sparse: a row lands when the appdetails budget '
+                    'reaches the title, so gaps mean "not checked", '
+                    'never "unchanged". changed compares against the '
+                    'previous stored digest for the same kind; a '
+                    'first observation is never a change.'},
+    )
+
+    storeassetid = Column(BigIntPk, primary_key=True)
+    gameid = Column(BigInteger, ForeignKey('games.game.gameid'),
+                    nullable=False)
+    checked_at = Column(Date, nullable=False,
+                        comment='UTC ingest date.')
+    asset_kind = Column(
+        Text, nullable=False,
+        comment='header | screenshots | movies | description.')
+    digest = Column(
+        Text, nullable=False,
+        comment='sha1 over the normalised asset content (URLs with '
+                'cache-busters stripped, movie id:name pairs, or '
+                'whitespace-collapsed description text).')
+    item_count = Column(
+        Integer, comment='Items behind the digest (screenshots or '
+                         'movies in the set; 1 for header and '
+                         'description).')
+    sample = Column(
+        Text, comment='First URL, first movie name, or the opening '
+                      'characters of the description - evidence for '
+                      'the change row, not the full asset.')
+    changed = Column(
+        Boolean, comment='True when the digest differs from this '
+                         "game's previous stored digest for the same "
+                         'kind; False on the first observation.')
+
+
+class CriticReview(Base):
+    """One OpenCritic outlet review per game — the rows behind
+    ``critic_score``'s aggregates, keyed on OpenCritic's own review id
+    so a re-fetch updates in place."""
+    __tablename__ = 'critic_review'
+    __table_args__ = (
+        UniqueConstraint('review_id', name='uq_critic_review_id'),
+        Index('ix_critic_review_gameid', 'gameid'),
+        Index('ix_critic_review_published', 'published_date'),
+        {'schema': 'games',
+         'comment': 'Per-outlet OpenCritic reviews per game - the '
+                    'distribution behind critic_score. Sparse by '
+                    'design: a title\'s reviews land when the review '
+                    'call budget reaches it, newest first and '
+                    'incremental, so absence means "not fetched yet", '
+                    'never "unreviewed", and a title past the page '
+                    'cap holds its newest reviews rather than the '
+                    'whole set. score is NULL for an unscored '
+                    'review.'},
+    )
+
+    criticreviewid = Column(BigIntPk, primary_key=True)
+    gameid = Column(BigInteger, ForeignKey('games.game.gameid'),
+                    nullable=False)
+    opencritic_id = Column(
+        BigInteger, nullable=False,
+        comment='OpenCritic game id the review was fetched under.')
+    review_id = Column(
+        Text, nullable=False,
+        comment="OpenCritic's own review id, kept as text so an "
+                'id-format change never drops rows.')
+    outlet = Column(Text, comment='Outlet name as published.')
+    outlet_id = Column(
+        BigInteger, comment='OpenCritic outlet id; NULL when absent.')
+    author = Column(
+        Text, comment='Author names joined with ", "; NULL when absent.')
+    score = Column(
+        Numeric, comment='Score on the 0-100 scale; NULL for an '
+                         'unscored review.')
+    published_date = Column(
+        Date, comment='UTC date the review was published; NULL when '
+                      'absent.')
+    url = Column(Text, comment="The review on the outlet's site.")
+    fetched_at = Column(
+        DateTime, nullable=False,
+        comment='Naive UTC; the last sweep that touched the row - the '
+                "lane's rotation watermark (max per gameid).")

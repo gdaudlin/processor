@@ -398,7 +398,25 @@ class TikApi(object):
                 'total_page', 1)
             if page >= total_pages:
                 break
+            if page >= 999:
+                logging.warning(
+                    'Maximum number of pages (999) reached for campaign list, '
+                    'buying types {}. There may be additional campaigns that '
+                    'were not retrieved.'.format(buying_types)
+                )
         return campaigns
+
+    def get_campaign_list(self):
+        """
+        Every campaign of the advertiser across all buying type groups.
+
+        :returns: list of campaign dicts
+        """
+        self.set_headers()
+        campaign_list = []
+        for buying_types in self.buying_type_groups:
+            campaign_list.extend(self.request_campaigns(buying_types))
+        return campaign_list
 
     def check_url(self):
         """
@@ -409,10 +427,7 @@ class TikApi(object):
 
         :returns: list of dicts of ad url and campaign id
         """
-        self.set_headers()
-        campaign_list = []
-        for buying_types in self.buying_type_groups:
-            campaign_list.extend(self.request_campaigns(buying_types))
+        campaign_list = self.get_campaign_list()
         if self.campaign_id:
             campaign_list = [
                 c for c in campaign_list

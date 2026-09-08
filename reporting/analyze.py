@@ -46,6 +46,7 @@ class Analyze(object):
     adserving_alert = 'adserving_alert'
     daily_pacing_alert = 'daily_pacing'
     raw_file_update_col = 'raw_file_update'
+    campaign_filter_col = 'campaign_filter_match'
     topline_col = 'topline_metrics'
     lw_topline_col = 'last_week_topline_metrics'
     tw_topline_col = 'two_week_topline_merics'
@@ -117,7 +118,8 @@ class Analyze(object):
         self.chat = None
         self.vc = ValueCalc()
         self.class_list = [
-            CheckRawFileUpdateTime, CheckFirstRow, CheckLastRow,
+            CheckRawFileUpdateTime, CheckCampaignFilter,
+            CheckFirstRow, CheckLastRow,
             CheckColumnNames, FindPlacementNameCol, CheckPlacementsNotInMp,
             CheckPlanPartnersNotDelivered,
             CheckAutoDictOrder, CheckApiDateLength, CheckFlatSpends,
@@ -3071,6 +3073,68 @@ class CheckRawFileUpdateTime(AnalyzeBase):
         return True
 
 
+class CheckCampaignFilter(AnalyzeBase):
+    """Surfaces campaign-filter match evidence per API card.
+
+    ``filter_df_on_campaign`` fails open, so a mistyped filter shows
+    up only as inflated numbers and a log line.  This reads the import
+    handler's per-card record into the analysis dict, so the app can
+    badge the card and raise a fix request instead.
+    """
+    name = Analyze.campaign_filter_col
+    match_col = 'matched'
+    total_col = 'total'
+    kept_all_col = 'kept_all'
+    verdict_col = 'verdict'
+    verdict_no_match = 'No Match - All Data Kept'
+    verdict_partial = 'Partial Match'
+    verdict_ok = 'OK'
+
+    @staticmethod
+    def read_stats():
+        """The import handler's per-vendor-key records, or {} when the
+        processor has not imported since this check shipped."""
+        file_name = os.path.join(utl.config_path,
+                                 utl.campaign_filter_stats_file)
+        if not os.path.exists(file_name):
+            return {}
+        try:
+            with open(file_name, 'r') as f:
+                stats_by_vk = json.load(f)
+        except (IOError, ValueError):
+            return {}
+        return stats_by_vk if isinstance(stats_by_vk, dict) else {}
+
+    @classmethod
+    def verdict(cls, stats):
+        """One card's match record as the word a person reads."""
+        if stats.get(cls.kept_all_col):
+            return cls.verdict_no_match
+        if stats.get(cls.match_col, 0) < stats.get(cls.total_col, 0):
+            return cls.verdict_partial
+        return cls.verdict_ok
+
+    def do_analysis(self):
+        rows = [{
+            vmc.vendorkey: vk,
+            'filter_values': ','.join(stats.get('filter_values', [])),
+            self.match_col: stats.get(self.match_col, 0),
+            self.total_col: stats.get(self.total_col, 0),
+            self.verdict_col: self.verdict(stats),
+            'sample_campaigns': ' | '.join(
+                stats.get('sample_campaigns', [])),
+            'date': stats.get('date', ''),
+        } for vk, stats in self.read_stats().items()
+            if isinstance(stats, dict)]
+        if not rows:
+            return False
+        msg = 'Campaign filter matches per API card are as follows:'
+        self.aly.add_to_analysis_dict(
+            key_col=self.name, message=msg,
+            data=pd.DataFrame(rows).to_dict())
+        return True
+
+
 class GetDailyPacingAlerts(AnalyzeBase):
     name = Analyze.placement_col
     fix = False
@@ -4074,9 +4138,46 @@ class AliChat(object):
         except Exception as exc:
             logging.warning(f'LLM telemetry hook failed: {exc}')
 
+    @staticmethod
+    def _server_error_detail(resp):
+        """The server's own explanation of a rejected request, read
+        while the response is still open.
+
+        ``raise_for_status`` reports only the status line, so a 400 is
+        an over-long prompt and an unknown model alike. Best-effort:
+        an unreadable body degrades to an empty detail.
+        """
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = None
+        detail = ''
+        if isinstance(payload, dict):
+            err = payload.get('error')
+            if isinstance(err, dict):
+                detail = err.get('message') or ''
+                counts = ', '.join(
+                    f'{k}={err[k]}' for k in ('n_prompt_tokens', 'n_ctx')
+                    if err.get(k) is not None)
+                if counts:
+                    detail = f'{detail} ({counts})'.strip()
+            elif isinstance(err, str):
+                detail = err
+        if not detail:
+            try:
+                detail = (resp.text or '').strip()
+            except Exception:
+                detail = ''
+        return detail[:500]
+
     def llm_request_generator(self, body, connect_timeout=5,
-                              read_timeout=120, retries=1):
+                              read_timeout=None, retries=1):
         """Stream parsed LLM deltas, never hanging or raising.
+
+        ``read_timeout`` is the socket *inactivity* timeout between
+        streamed bytes; ``None`` takes ``LLM_STREAM_READ_TIMEOUT``
+        (default 120s). Benchmarks on a CPU-offloaded box raise it —
+        a 27k-token prompt can take minutes before the first delta.
 
         A connect-phase failure (connection refused / timed out
         before any delta arrived) is retried once — nothing has
@@ -4091,7 +4192,11 @@ class AliChat(object):
         consumed here for the timing log, never forwarded.
         """
         body.setdefault('stream_options', {'include_usage': True})
+        if read_timeout is None:
+            read_timeout = int(
+                os.environ.get('LLM_STREAM_READ_TIMEOUT', '120') or 120)
         attempts = 0
+        error_detail = ''
         yielded = False
         t0 = time.time()
         t_first = None
@@ -4103,7 +4208,11 @@ class AliChat(object):
                 with requests.post(
                         self.llm_url, json=body, stream=True,
                         timeout=(connect_timeout, read_timeout)) as r:
-                    r.raise_for_status()
+                    try:
+                        r.raise_for_status()
+                    except requests.exceptions.RequestException:
+                        error_detail = self._server_error_detail(r)
+                        raise
                     r.encoding = 'utf-8'
                     for delta in self._parse_llm_stream_lines(r):
                         if delta.get('type') == 'usage':
@@ -4130,9 +4239,11 @@ class AliChat(object):
                         f"LLM connect failed ({exc}) — retrying "
                         f"({attempts}/{retries}).")
                     continue
-                logging.warning(f"LLM stream failed: {exc}")
-                yield {"type": "error",
-                       "delta": f"{type(exc).__name__}: {exc}"}
+                reason = f"{type(exc).__name__}: {exc}"
+                if error_detail:
+                    reason = f"{reason} — {error_detail}"
+                logging.warning(f"LLM stream failed: {reason}")
+                yield {"type": "error", "delta": reason}
                 self._log_llm_timing(
                     body, t0, t_first, delta_count, usage_info,
                     finish_reason or 'error')

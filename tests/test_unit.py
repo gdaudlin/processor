@@ -20,6 +20,7 @@ import processor.reporting.dictcolumns as dctc
 import processor.reporting.calc as cal
 import processor.reporting.analyze as az
 import processor.reporting.errorreport as er
+import psycopg2
 import processor.reporting.export as exp
 import processor.reporting.expcolumns as exc
 import processor.reporting.azapi as azapi
@@ -701,6 +702,23 @@ class TestApis:
         self.send_api_call(api)
         self.send_test_api_call(api)
 
+    def test_awapi_loads_a_config_without_its_section(self, tmp_path_factory):
+        """A card config that has lost its `adwords:` section still
+        runs, reading the file as its own section. The next write of
+        the file nests it again.
+        """
+        config = {'client_customer_id': '123', 'client_id': 'abc',
+                  'campaign_filter': 'sem'}
+        file_name = '{}/awconfig.yaml'.format(
+            tmp_path_factory.mktemp('config'))
+        with open(file_name, 'w') as f:
+            yaml.dump(config, f)
+        api = awapi.AwApi()
+        api.configfile = file_name
+        api.load_config()
+        assert api.client_customer_id == '123'
+        assert api.campaign_filter == 'sem'
+
     @staticmethod
     def send_test_api_call(api):
         vk = ''
@@ -784,6 +802,114 @@ def _download_stub(download_url):
 
 def _no_sleep(*args, **kwargs):
     """Keep polling loops instant under test."""
+
+
+class TestAccountListing:
+    """Dict loaders and the account listings the app's pickers call."""
+
+    @staticmethod
+    def response(payload, status_code=200):
+        return types.SimpleNamespace(status_code=status_code,
+                                     json=lambda: payload)
+
+    def test_load_config_dict_skips_the_file(self):
+        cases = [
+            (fbapi.FbApi(), 'access_token',
+             {'app_id': 'a', 'app_secret': 's', 'access_token': 't'}),
+            (awapi.AwApi(), 'developer_token',
+             {'client_id': 'c', 'client_secret': 's', 'developer_token': 'd',
+              'refresh_token': 'r', 'login_customer_id': '1'}),
+            (dcapi.DcApi(), 'refresh_url',
+             {'client_id': 'c', 'client_secret': 's', 'refresh_token': 'r',
+              'refresh_url': 'u'}),
+            (amzapi.AmzApi(), 'refresh_token',
+             {'client_id': 'c', 'client_secret': 's', 'refresh_token': 'r'}),
+            (yvapi.YvApi(), 'client_secret',
+             {'client_id': 'c', 'client_secret': 's', 'advertiser': '7'}),
+        ]
+        for api, key, config in cases:
+            api.load_config_dict(config)
+            assert getattr(api, key) == config[key]
+            assert api.config is config
+        assert cases[1][0].login_customer_id == '1'
+        assert cases[1][0].client_customer_id == ''
+        assert cases[4][0].advertiser == 7
+
+    def test_fb_ad_accounts_export_rows(self, monkeypatch):
+        row = types.SimpleNamespace(
+            export_all_data=lambda: {'account_id': '1', 'name': 'One'})
+        monkeypatch.setattr(fbapi, 'User', lambda fbid: types.SimpleNamespace(
+            get_ad_accounts=lambda fields=None: [row]))
+        assert fbapi.FbApi.get_ad_accounts() == [
+            {'account_id': '1', 'name': 'One'}]
+
+    def test_aw_accessible_customers_strip_prefix(self, monkeypatch):
+        api = awapi.AwApi()
+        monkeypatch.setattr(api, 'get_client', lambda: {})
+        api.client = types.SimpleNamespace(
+            get=lambda url, headers=None: self.response(
+                {'resourceNames': ['customers/1', 'customers/2']}))
+        assert api.get_accessible_customers() == ['1', '2']
+        api.client = types.SimpleNamespace(
+            get=lambda url, headers=None: self.response({'error': 'x'}))
+        assert api.get_accessible_customers() == []
+
+    def test_aw_customer_clients_parse_and_skip_failures(self, monkeypatch):
+        api = awapi.AwApi()
+        page = [{'results': [{'customerClient': {
+            'id': '10', 'descriptiveName': 'Client', 'manager': False}}]}]
+        monkeypatch.setattr(api, 'request_report',
+                            lambda report: self.response(page))
+        assert api.get_customer_clients('9') == [
+            {'id': '10', 'name': 'Client', 'manager': False}]
+        assert (api.login_customer_id, api.client_customer_id) == ('9', '9')
+        monkeypatch.setattr(api, 'request_report',
+                            lambda report: self.response([{'error': {}}], 403))
+        assert api.get_customer_clients('9') == []
+        monkeypatch.setattr(api, 'request_report', lambda report: None)
+        assert api.get_customer_clients('9') == []
+
+    def test_dc_user_profiles_share_the_url(self, monkeypatch):
+        api = dcapi.DcApi()
+        api.usr_id = '55'
+        assert api.create_user_url() == (
+            'https://www.googleapis.com/dfareporting/v5/userprofiles/55/')
+        monkeypatch.setattr(api, 'get_client', lambda: None)
+        api.client = types.SimpleNamespace(
+            get=lambda url: self.response({'items': [{'profileId': 1}]}))
+        assert api.get_user_profiles() == [{'profileId': 1}]
+        api.client = types.SimpleNamespace(
+            get=lambda url: self.response({'error': {}}, 401))
+        assert api.get_user_profiles() == []
+
+    def test_amz_builds_without_a_config_dir(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        assert amzapi.AmzApi().report_cache == {}
+
+    def test_amz_request_profiles_waits_for_a_list(self, monkeypatch):
+        api = amzapi.AmzApi()
+        monkeypatch.setattr(amzapi.time, 'sleep', lambda s: None)
+        answers = [{'code': 'PENDING'}, [{'profileId': 1}]]
+        monkeypatch.setattr(
+            api, 'make_request',
+            lambda url, method, headers=None: self.response(answers.pop(0)))
+        assert api.request_profiles(api.eu_url) == [{'profileId': 1}]
+        monkeypatch.setattr(
+            api, 'make_request',
+            lambda url, method, headers=None: self.response({'code': 'NO'}))
+        assert api.request_profiles(api.eu_url) == []
+
+    def test_red_request_ad_accounts_feeds_the_username_match(
+            self, monkeypatch):
+        api = redapi.RedApi()
+        api.username = 'Liquid'
+        rows = [{'id': 't2_a', 'name': 'liquid', 'time_zone_id': 'UTC'}]
+        monkeypatch.setattr(redapi.requests, 'get',
+                            lambda url, headers=None: self.response(
+                                {'data': rows}))
+        assert api.request_ad_accounts('b1') == rows
+        assert api.get_ad_accounts_by_business(['b1']) == 't2_a'
+        assert api.time_zone_id == 'UTC'
 
 
 class TestSimApi:
@@ -894,6 +1020,58 @@ class TestSimApi:
                                       'desktop_visits']
 
 
+class _FakeGaClient(object):
+    """Stand in for the GA session, breaking n posts before it answers."""
+
+    def __init__(self, breaks, response=None):
+        self.breaks = breaks
+        self.response = response
+        self.calls = 0
+
+    def post(self, url, json=None):
+        self.calls += 1
+        if self.calls <= self.breaks:
+            raise gaapi.requests.exceptions.ChunkedEncodingError(
+                'Connection broken: IncompleteRead(1239 bytes read, '
+                '9001 more expected)')
+        return self.response
+
+
+class TestGaApi:
+    """A GA response body that stops mid stream retries, never raises."""
+
+    @staticmethod
+    def make_api(monkeypatch, breaks, rows=True):
+        response = _FakeResponse(200, json_data={
+            'dimensionHeaders': [{'name': 'date'}],
+            'metricHeaders': [{'name': 'sessions'}],
+            'rows': [{'dimensionValues': [{'value': '20260826'}],
+                      'metricValues': [{'value': '5'}]}]}) if rows else None
+        api = gaapi.GaApi()
+        api.ga_id = '1234'
+        api.max_attempts = 3
+        api.client = _FakeGaClient(breaks, response)
+        monkeypatch.setattr(api, 'get_client', _no_sleep)
+        monkeypatch.setattr(gaapi.time, 'sleep', _no_sleep)
+        return api
+
+    def test_broken_read_retries_then_recovers(self, monkeypatch):
+        """The df still comes back once a later attempt reads cleanly."""
+        api = self.make_api(monkeypatch, breaks=2)
+        df = api.get_data()
+        assert api.client.calls == 3
+        assert list(df['sessions']) == ['5']
+
+    def test_broken_read_exhausts_retries_to_empty_df(self, monkeypatch):
+        """Retries spent, the vendor yields an empty df instead of killing
+        the run - importhandler leaves the last good raw file alone."""
+        api = self.make_api(monkeypatch, breaks=99)
+        df = api.get_data()
+        assert api.client.calls == api.max_attempts
+        assert df.empty
+        assert api.r is None
+
+
 class TestVendormatrix:
     def test_ad_cost_calculation(self):
         clicks = 10
@@ -941,6 +1119,25 @@ class TestVendormatrix:
         plan_val = matrix.vm[bar_col][vm.plan_key]
         assert isinstance(plan_val, list)
 
+    @pytest.mark.parametrize('contents', [
+        '', 'FILENAME,Placement Name\n', 'not a csv\n"unclosed\n'])
+    def test_vm_parse_survives_an_unreadable_file(self, tmp_path, monkeypatch,
+                                                  contents):
+        """An empty or unparsable Vendormatrix.csv read back as None or
+        as a frame without a Vendor Key column, and everything indexes
+        the matrix by that column, so opening a processor whose file had
+        been truncated raised a KeyError instead of a warning."""
+        os.makedirs(os.path.join(tmp_path, utl.config_path))
+        with open(os.path.join(tmp_path, vm.csv_full_file), 'w') as f:
+            f.write(contents)
+        monkeypatch.chdir(tmp_path)
+        matrix = vm.VendorMatrix()
+        assert vmc.vendorkey in matrix.vm_df.columns
+        assert not matrix.vm_df.columns.duplicated().any()
+        assert matrix.vm_df.empty
+        assert matrix.vl == [vm.plan_key]
+        assert vm.ImportConfig(matrix=matrix).get_current_imports() == []
+
     @staticmethod
     def _bare_source(original, new):
         return {
@@ -985,6 +1182,35 @@ class TestVendormatrix:
         })
         result = ic.get_default_vm_value('DBM', 'API')
         assert len(result) == 1
+
+    def test_get_config_file_value_without_the_section(self):
+        """An Adwords config that has lost its `adwords:` section reads
+        from the root instead of raising, so the card keeps reporting
+        its account id. Reading one used to KeyError, which took down
+        every Set Imports save on the processor.
+        """
+        get_value = vm.ImportConfig.get_config_file_value
+        nested = {'adwords': {'client_customer_id': '123'}}
+        assert get_value(nested, 'client_customer_id', 'adwords') == '123'
+        flat = {'client_customer_id': '456'}
+        assert get_value(flat, 'client_customer_id', 'adwords') == '456'
+        assert get_value(flat, 'campaign_filter', 'adwords') == ''
+
+    def test_set_config_file_value_creates_the_section(self):
+        """Writing a nested param into a flattened config nests it,
+        leaving no second answer at the root."""
+        config = vm.ImportConfig.set_config_file_value(
+            {'client_customer_id': '456'}, 'client_customer_id', '123',
+            'adwords')
+        assert config == {'adwords': {'client_customer_id': '123'}}
+
+    def test_set_config_file_value_skips_an_unnamed_param(self):
+        """A Key with no import_config row falls back to the raw file
+        params, whose account id column is empty; that must not stamp a
+        nan key into the config file it copied."""
+        config = vm.ImportConfig.set_config_file_value(
+            {'campaign_id': ''}, np.nan, '123')
+        assert config == {'campaign_id': ''}
 
 
 class TestDictionary:
@@ -2261,6 +2487,44 @@ conv_event_sum_cols = [
 ]
 
 
+class FakeConn:
+    """A raw_connection() double: it remembers being closed."""
+
+    def __init__(self):
+        self.closed = False
+
+    def cursor(self):
+        return object()
+
+    def close(self):
+        self.closed = True
+
+
+class FakeEngine:
+    """An engine double that counts checkouts and disposals, and can
+    refuse the next ``fail_times`` connects the way psycopg2 does when
+    the host is out of ephemeral ports."""
+
+    def __init__(self):
+        self.conns = []
+        self.checkouts = 0
+        self.disposals = 0
+        self.fail_times = 0
+
+    def raw_connection(self):
+        self.checkouts += 1
+        if self.fail_times:
+            self.fail_times -= 1
+            raise psycopg2.OperationalError(
+                'connection to server at "127.0.0.1", port 5434 failed: '
+                'Address already in use')
+        self.conns.append(FakeConn())
+        return self.conns[-1]
+
+    def dispose(self):
+        self.disposals += 1
+
+
 class TestExport:
 
     @pytest.mark.parametrize(
@@ -2547,6 +2811,55 @@ class TestExport:
         append_tables = sb.get_active_event_tables(metrics)
         assert set(append_tables) == set(expected_tables)
 
+    @staticmethod
+    def make_db(monkeypatch, engines):
+        """An exp.DB whose engine is a recording double."""
+        db = exp.DB()
+        db.host, db.conn_string = 'h', 'postgresql://u:p@h:1/d'
+        monkeypatch.setattr(
+            exp.sqa, 'create_engine',
+            lambda *a, **kw: engines.append(FakeEngine()) or engines[-1])
+        return db
+
+    def test_close_is_safe_with_nothing_open(self):
+        exp.DB().close()
+
+    def test_connect_reuses_one_engine(self, monkeypatch):
+        """An upload connects several times per table across ~25
+        tables. Building an engine per statement opened a socket every
+        time and closed none of them, and a host that runs out of
+        ephemeral ports fails the export mid-write ("Address already
+        in use"). One engine, and the last checkout handed back before
+        the next."""
+        engines = []
+        db = self.make_db(monkeypatch, engines)
+        for _ in range(5):
+            db.connect()
+        assert len(engines) == 1, 'an engine per connect leaks sockets'
+        assert engines[0].checkouts == 5
+        assert sum(c.closed for c in engines[0].conns) == 4
+        db.close()
+        assert all(c.closed for c in engines[0].conns)
+        assert db.connection is None
+
+    def test_connect_retries_a_refused_connection(self, monkeypatch):
+        """Port pressure and a restarting database both clear on
+        their own, so a refused connect backs off and tries again
+        rather than ending the run. psycopg2 raises its own
+        OperationalError through raw_connection() -- the SQLAlchemy
+        wrapper this used to catch never sees it."""
+        engines = []
+        db = self.make_db(monkeypatch, engines)
+        monkeypatch.setattr(exp.time, 'sleep', lambda s: None)
+        db.connect()
+        engines[0].fail_times = 2
+        db.connect()
+        assert engines[0].checkouts == 4, 'two failures, then a hand-back'
+        assert engines[0].disposals == 2
+        engines[0].fail_times = exp.CONNECT_ATTEMPTS
+        with pytest.raises(psycopg2.OperationalError):
+            db.connect()
+
 
 class TestRun:
     @requires_base_config
@@ -2752,9 +3065,9 @@ class TestGamesDb:
                   'headline_metric': 'Player Share', 'current': 0.5,
                   'prior': 0.4, 'share': 0.62, 'share_delta': 0.02,
                   'movement': 'Rising', 'primary_period': '2026-07',
-                  'comparison_period': '2026-06', 'genre': 'Shooter'}
+                  'comparison_period': '2026-06', 'genre': 'Shooter',
+                  'set_size': 40, 'signals': 7}
         assert gdb.upsert_fact(s, gmdl.TitleScore, key, fields) == 1
-        # Unmatched titles land too, with a NULL gameid.
         assert gdb.upsert_fact(
             s, gmdl.TitleScore,
             {'score_date': day, 'title': 'Mystery Title'},
@@ -2771,6 +3084,7 @@ class TestGamesDb:
         assert row.gameid == game.gameid
         assert row.movement == 'Rising'
         assert row.genre == 'Shooter'
+        assert row.set_size == 40 and row.signals == 7
 
     def test_new_games_facts_use_full_natural_keys(self):
         s = self._session()
@@ -2858,6 +3172,139 @@ class TestGamesDb:
             stat_date=dt.date(2026, 8, 21)).one()
         assert float(latest.views) == 1600
         assert latest.youtubevideoid == video.youtubevideoid
+
+    def test_pulse_and_price_upserts_idempotent(self):
+        s = self._session()
+        game = gdb.upsert_game(s, 'Halo Infinite',
+                               registry_slug='halo-infinite')
+        slot = dt.datetime(2026, 8, 31, 8)
+        pulse_key = {'gameid': game.gameid, 'sampled_at': slot}
+        assert gdb.upsert_fact(
+            s, gmdl.CommunityPulse, pulse_key,
+            {'twitch_viewers': 42000, 'twitch_channels': 310,
+             'sponsored_streams': 2}) == 1
+        assert gdb.upsert_fact(
+            s, gmdl.StreamFlag,
+            {'gameid': game.gameid, 'sampled_at': slot,
+             'channel': 'streamer_one'},
+            {'title': 'Halo w/ sponsor #ad', 'token': '#ad',
+             'viewer_count': 1200}) == 1
+        s.commit()
+        assert gdb.upsert_fact(
+            s, gmdl.CommunityPulse, pulse_key,
+            {'twitch_viewers': 43000}) == 0
+        assert gdb.upsert_fact(
+            s, gmdl.StreamFlag,
+            {'gameid': game.gameid, 'sampled_at': slot,
+             'channel': 'streamer_one'}, {'viewer_count': 1300}) == 0
+        s.commit()
+        assert s.query(gmdl.CommunityPulse).count() == 1
+        assert s.query(gmdl.StreamFlag).count() == 1
+        pulse = s.query(gmdl.CommunityPulse).one()
+        assert float(pulse.twitch_viewers) == 43000
+        assert float(pulse.sponsored_streams) == 2
+        price_key = {'gameid': game.gameid,
+                     'price_date': dt.date(2026, 8, 31)}
+        assert gdb.upsert_fact(
+            s, gmdl.PriceSnapshot, price_key,
+            {'currency': 'USD', 'base_price': 59.99,
+             'final_price': 29.99, 'discount_pct': 50}) == 1
+        assert gdb.upsert_fact(
+            s, gmdl.PriceSnapshot, price_key,
+            {'final_price': 59.99, 'discount_pct': 0}) == 0
+        s.commit()
+        snap = s.query(gmdl.PriceSnapshot).one()
+        assert float(snap.discount_pct) == 0
+        assert float(snap.base_price) == 59.99
+
+    def test_store_asset_upsert_idempotent(self):
+        s = self._session()
+        game = gdb.upsert_game(s, 'Halo Infinite',
+                               registry_slug='halo-infinite')
+        key = {'gameid': game.gameid,
+               'checked_at': dt.date(2026, 9, 1),
+               'asset_kind': 'screenshots'}
+        assert gdb.upsert_fact(
+            s, gmdl.StoreAsset, key,
+            {'digest': 'abc', 'item_count': 6,
+             'sample': 'https://cdn/ss_1.jpg', 'changed': False}) == 1
+        s.commit()
+        assert gdb.upsert_fact(
+            s, gmdl.StoreAsset, key, {'digest': 'def',
+                                      'changed': True}) == 0
+        s.commit()
+        row = s.query(gmdl.StoreAsset).one()
+        assert row.digest == 'def' and row.changed is True
+        assert row.item_count == 6
+
+    def test_critic_review_upsert_idempotent(self):
+        """A re-fetch restamps the row in place, and an unscored
+        review is legal."""
+        s = self._session()
+        game = gdb.upsert_game(s, 'Halo Infinite',
+                               registry_slug='halo-infinite')
+        key = {'review_id': '9001'}
+        stamp = dt.datetime(2026, 9, 4, 8, 0)
+        assert gdb.upsert_fact(
+            s, gmdl.CriticReview, key,
+            {'gameid': game.gameid, 'opencritic_id': 42,
+             'outlet': 'IGN', 'score': 90,
+             'published_date': dt.date(2026, 9, 1),
+             'fetched_at': stamp}) == 1
+        s.commit()
+        later = stamp + dt.timedelta(days=1)
+        assert gdb.upsert_fact(
+            s, gmdl.CriticReview, key,
+            {'score': None, 'fetched_at': later}) == 0
+        s.commit()
+        row = s.query(gmdl.CriticReview).one()
+        assert row.score is None and row.fetched_at == later
+        assert row.outlet == 'IGN' and row.gameid == game.gameid
+
+    def test_critic_review_id_unique_constraint(self):
+        """The natural key is OpenCritic's review id, so a second row
+        carrying it is a duplicate whatever game it claims."""
+        s = self._session()
+        game = gdb.upsert_game(s, 'Game A', opencritic_id=42)
+        s.commit()
+        fields = dict(gameid=game.gameid, opencritic_id=42,
+                      review_id='9001',
+                      fetched_at=dt.datetime(2026, 9, 4))
+        s.add(gmdl.CriticReview(**fields))
+        s.commit()
+        s.add(gmdl.CriticReview(**fields))
+        assert gdb.safe_commit(s, 'test') is False
+
+    def test_store_asset_fields_shapes(self):
+        assert gamesw.store_asset_fields(None) == []
+        assert gamesw.store_asset_fields({}) == []
+        data = {
+            'header_image': 'https://cdn/header.jpg?t=1700000000',
+            'screenshots': [
+                {'id': 0, 'path_full': 'https://cdn/ss_a.jpg?t=1'},
+                {'id': 1, 'path_full': 'https://cdn/ss_b.jpg?t=2'}],
+            'movies': [{'id': 256, 'name': 'Launch Trailer',
+                        'webm': {'max': 'https://cdn/m.webm?t=3'}}],
+            'short_description': '  Fight   the\nBanished.  '}
+        rows = dict(gamesw.store_asset_fields(data))
+        assert list(rows) == list(gamesw.ASSET_KINDS)
+        restamped = dict(gamesw.store_asset_fields({
+            **data, 'header_image': 'https://cdn/header.jpg?t=9',
+            'screenshots': [
+                {'id': 0, 'path_full': 'https://cdn/ss_a.jpg?t=7'},
+                {'id': 1, 'path_full': 'https://cdn/ss_b.jpg?t=8'}]}))
+        for kind in gamesw.ASSET_KINDS:
+            assert rows[kind]['digest'] == restamped[kind]['digest']
+        assert rows['header']['sample'] == 'https://cdn/header.jpg'
+        assert rows['screenshots']['item_count'] == 2
+        assert rows['movies']['sample'] == 'Launch Trailer'
+        assert rows['description']['sample'] == 'Fight the Banished.'
+        swapped = dict(gamesw.store_asset_fields({
+            **data, 'header_image': 'https://cdn/header_v2.jpg'}))
+        assert swapped['header']['digest'] != rows['header']['digest']
+        partial = dict(gamesw.store_asset_fields(
+            {'short_description': 'Only words.'}))
+        assert list(partial) == ['description']
 
     def test_review_text_and_theme_upsert_idempotent(self):
         s = self._session()

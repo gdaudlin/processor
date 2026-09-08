@@ -66,6 +66,26 @@ class VendorMatrix(object):
                 self.vm_df[miss_col] = ''
         self.vm_df[cols].to_csv(csv_full_file, index=False, encoding='utf-8')
 
+    @staticmethod
+    def blank_df():
+        """Returns an empty vendor matrix carrying every expected column."""
+        return pd.DataFrame(columns=[vmc.vendorkey] + vmc.vmkeys)
+
+    def vm_col_check(self, df):
+        """Restores the columns the vendor matrix file did not supply.
+
+        :param df: the vendor matrix as read from disk
+        :returns: a df holding the vendor key and every vm column
+        """
+        if df is None or vmc.vendorkey not in df.columns:
+            logging.warning('Could not read {}.  Continuing with a blank '
+                            'vendor matrix.'.format(csv_full_file))
+            return self.blank_df()
+        for col in [x for x in [vmc.vendorkey] + vmc.vmkeys
+                    if x not in df.columns]:
+            df[col] = ''
+        return df
+
     def plan_net_check(self):
         if not self.vm['Vendor Key'].isin(['Plan Net']).any():
             logging.warning('No Plan Net key in Vendor Matrix.  Add it.')
@@ -82,12 +102,9 @@ class VendorMatrix(object):
         if not df.empty:
             self.vm_df = df
         else:
-            self.vm_df = pd.DataFrame(columns=vmc.datacol)
             self.vm_df = self.read()
+        self.vm_df = self.vm_col_check(self.vm_df)
         self.vm_df = self.add_file_name_col()
-        if self.vm_df is None:
-            cols = vmc.vmkeys + vmc.datacol
-            self.vm_df = pd.DataFrame(columns=cols)
         self.vm = self.vm_df.copy()
         self.plan_net_check()
         drop = self.vm.columns[self.vm.columns.str.startswith('|')]
@@ -399,7 +416,7 @@ class ImportConfig(object):
     def import_vm(self):
         if not self.matrix:
             self.matrix = VendorMatrix(display_log=False)
-        self.matrix_df = self.matrix.read()
+        self.matrix_df = self.matrix.vm_col_check(self.matrix.read())
         self.df = self.read()
 
     def read(self):
@@ -443,20 +460,49 @@ class ImportConfig(object):
 
     @staticmethod
     def get_config_file_value(config_file, name, nest=None):
-        if not pd.isna(nest) and name in config_file[nest]:
-            value = config_file[nest][name]
-        elif name not in config_file:
-            value = ''
-        else:
-            value = config_file[name]
-        return value
+        """
+        Reads one param from a config file, from the channel's nested
+        section when it declares one.
+
+        A file that has lost its section - flattened by hand, or copied
+        from a channel that does not nest - is read from the root
+        instead of raising, so the card still reports its account id
+        and the next save nests it again.
+
+        :param config_file:Loaded contents of the card's config file
+        :param name:Config param to read, ignored when unnamed
+        :param nest:Section holding the channel's params, if any
+        :return:Value of the param, or '' when the file has none
+        """
+        section = None if pd.isna(nest) else config_file.get(nest)
+        if isinstance(section, dict) and name in section:
+            return section[name]
+        return config_file[name] if name in config_file else ''
 
     @staticmethod
     def set_config_file_value(config_file, name, new_val, nest=None):
+        """
+        Writes one param into a config file, creating the channel's
+        nested section when the file has none.
+
+        A param the channel's import config does not name is written
+        nowhere: a Key with no import_config row falls back to the raw
+        file params, which would otherwise stamp an unnamed key into
+        the config file it copies.
+
+        :param config_file:Loaded contents of the card's config file
+        :param name:Config param to write, ignored when unnamed
+        :param new_val:Value to write
+        :param nest:Section holding the channel's params, if any
+        :return:The config file, changed in place
+        """
         if not config_file:
             config_file = {}
+        if pd.isna(name):
+            return config_file
         if not pd.isna(nest):
-            config_file[nest][name] = new_val
+            config_file.setdefault(nest, {})[name] = new_val
+            config_file.pop(name, None)
         else:
             config_file[name] = new_val
         return config_file
@@ -704,8 +750,6 @@ class ImportConfig(object):
         if not matrix:
             self.import_vm()
         import_dicts = []
-        if self.matrix_df is None:
-            return import_dicts
         api_keys = [x for x in self.matrix_df[vmc.vendorkey]
                     if x[:4] == import_type]
         for api_key in api_keys:

@@ -7,6 +7,7 @@ details, keyed by appid). This module upserts the ``game`` dimension by
 Fail-soft by design: any games-DB problem logs and returns 0 so the
 raw-CSV pull output is never endangered.
 """
+import hashlib
 import math
 import logging
 import reporting.gamesdb as gdb
@@ -16,6 +17,8 @@ EVENT_MEASURES = (
     'player_count', 'owners_in_sample', 'wishlists_in_sample',
     'avg_achievement_pct', 'review_score', 'total_positive',
     'total_negative', 'total_reviews')
+ASSET_KINDS = ('header', 'screenshots', 'movies', 'description')
+ASSET_SAMPLE_CHARS = 160
 
 
 def games_db_available(config='steamdbconfig.json'):
@@ -57,6 +60,86 @@ def price_of(value):
     if isinstance(value, dict) and value.get('final') is not None:
         return value['final'] / 100
     return None
+
+
+def price_snapshot_fields(value):
+    """appdetails ``price_overview`` dict -> ``price_snapshot``
+    columns, or None when the block is absent or priceless (free
+    titles carry no price_overview; their sale cycle is not a
+    thing)."""
+    if not isinstance(value, dict):
+        return None
+    initial, final = value.get('initial'), value.get('final')
+    if initial is None and final is None:
+        return None
+    return {
+        'currency': value.get('currency'),
+        'base_price': None if initial is None else initial / 100,
+        'final_price': None if final is None else final / 100,
+        'discount_pct': value.get('discount_percent') or 0,
+    }
+
+
+def _asset_url(value):
+    """A storefront asset URL with its ``?t=`` cache-buster stripped —
+    Steam re-stamps the query string without changing the asset, so
+    hashing the full URL would report a change every re-stamp."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip().split('?', 1)[0]
+
+
+def _asset_urls(items, key):
+    """Clean URLs under ``key`` across a list of appdetails dicts."""
+    if not isinstance(items, list):
+        return []
+    urls = (_asset_url(item.get(key)) for item in items
+            if isinstance(item, dict))
+    return [url for url in urls if url]
+
+
+def _movie_labels(items):
+    """``id:name`` per appdetails movie — the stable identity of a
+    trailer (its webm/mp4 URLs are cache-busted like the images)."""
+    if not isinstance(items, list):
+        return []
+    return [f"{item.get('id')}:{item.get('name') or ''}"
+            for item in items
+            if isinstance(item, dict) and item.get('id') is not None]
+
+
+def _asset_row(items, sample):
+    """One ``store_asset`` measure dict over the normalised items."""
+    digest = hashlib.sha1('\n'.join(items).encode('utf-8')).hexdigest()
+    return {'digest': digest, 'item_count': len(items),
+            'sample': sample[:ASSET_SAMPLE_CHARS]}
+
+
+def store_asset_fields(data):
+    """appdetails payload -> ``[(asset_kind, store_asset columns)]``
+    for each storefront asset the payload carries, in
+    :data:`ASSET_KINDS` order. Kinds the payload lacks are skipped
+    rather than hashed empty, so an absent trailer set is "not
+    observed", never "changed to nothing"."""
+    if not isinstance(data, dict):
+        return []
+    out = []
+    header = _asset_url(data.get('header_image'))
+    if header:
+        out.append(('header', _asset_row([header], header)))
+    shots = _asset_urls(data.get('screenshots'), 'path_full')
+    if shots:
+        out.append(('screenshots', _asset_row(shots, shots[0])))
+    movies = _movie_labels(data.get('movies'))
+    if movies:
+        first = (data['movies'][0].get('name') or movies[0])
+        out.append(('movies', _asset_row(movies, str(first))))
+    description = ' '.join(str(data.get('short_description') or '')
+                           .split())
+    if description:
+        out.append(('description',
+                    _asset_row([description], description)))
+    return out
 
 
 def game_fields(row):
