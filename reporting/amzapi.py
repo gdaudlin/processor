@@ -35,6 +35,7 @@ class AmzApi(object):
     eu_url = 'https://advertising-api-eu.amazon.com'
     fe_url = 'https://advertising-api-fe.amazon.com'
     refresh_url = 'https://api.amazon.com/auth/o2/token'
+    max_date_length = 30
     def_metrics = [
         'impressions', 'clicks', 'cost',
         'attributedConversions14d',
@@ -1031,6 +1032,7 @@ class AmzApi(object):
 
     def get_data(self, sd=None, ed=None, fields=None):
         self.report_ids = []
+        self.report_types = []
         self.df = pd.DataFrame()
         self.profile_id = None
         self.export_id = ''
@@ -1682,11 +1684,20 @@ class AmzApi(object):
 
     @staticmethod
     def list_dates(sd, ed):
-        dates = []
-        while sd < ed:
-            dates.append(sd)
-            sd = sd + dt.timedelta(days=1)
-        return dates
+        """
+        Lists the report days from sd through ed, never past today.
+
+        The end is inclusive so a piece of a longer window keeps its
+        last day; callers that bump a same day end past midnight still
+        stop on today.
+
+        :param sd: first day to report
+        :param ed: last day to report, inclusive
+        :returns: list of datetimes, one per day
+        """
+        last = min(ed, dt.datetime.today())
+        span = (last.date() - sd.date()).days + 1
+        return [sd + dt.timedelta(days=x) for x in range(max(span, 0))]
 
     def check_advertiser_id(self, results, acc_col, success_msg, failure_msg):
         profile = self.get_profiles()

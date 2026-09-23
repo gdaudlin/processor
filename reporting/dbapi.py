@@ -19,6 +19,7 @@ class DbApi(object):
     campaign_groups = ['FILTER_MEDIA_PLAN', 'FILTER_MEDIA_PLAN_NAME']
     campaign_col = 'Campaign'
     campaign_id_col = 'Campaign ID'
+    max_date_length = 60
     base_groups = [
         'FILTER_ADVERTISER', 'FILTER_ADVERTISER_NAME',
         'FILTER_ADVERTISER_CURRENCY',
@@ -232,6 +233,8 @@ class DbApi(object):
         :param fields: The API_FIELDS values from the vendor matrix
         :return: The report as a dataframe
         """
+        self.query_id = None
+        self.report_id = self.config.get('report_id') if self.config else None
         self.parse_campaign_filter()
         self.get_report_df(sd, ed, fields)
         retried = bool(self.df.empty and self.campaign_ids and self.query_id)

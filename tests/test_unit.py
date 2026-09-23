@@ -1785,6 +1785,60 @@ class TestCalc:
         assert ndf[cal.CLI_PD][0] == (click_one / (click_one + click_two))
 
 
+class _CappedApi(object):
+    """Capped fake API that records the windows it is asked for."""
+    max_date_length = 30
+
+    def __init__(self, calls=None):
+        self.calls = calls if calls is not None else []
+
+    def input_config(self, config):
+        pass
+
+    def get_data(self, sd=None, ed=None, fields=None):
+        self.calls.append((sd, ed))
+        return pd.DataFrame({'day': [sd], 'n': [1]})
+
+
+class _OpenApi(_CappedApi):
+    """Uncapped fake API."""
+    max_date_length = None
+
+
+class _UndatedApi(_CappedApi):
+    """Capped fake API whose Unique field carries no dates."""
+    undated_fields = ('Unique',)
+
+
+class _EmptyApi(_CappedApi):
+    """Capped fake API that never has rows."""
+    max_date_length = 10
+
+    def get_data(self, sd=None, ed=None, fields=None):
+        self.calls.append((sd, ed))
+        return pd.DataFrame()
+
+
+class _DailyApi(_CappedApi):
+    """Capped fake API returning one dated row per day asked for."""
+
+    def get_data(self, sd=None, ed=None, fields=None):
+        self.calls.append((sd, ed))
+        days = pd.date_range(sd, ed)
+        return pd.DataFrame({'stat_datetime': days.strftime('%Y-%m-%d'),
+                             'n': range(len(days))})
+
+
+class _CardMatrix(object):
+    """Stand-in vendor matrix serving one API card's parameters."""
+
+    def __init__(self, params):
+        self.params = params
+
+    def vendor_set(self, vk):
+        return dict(self.params)
+
+
 class TestAnalyze:
     vm_df = None
     
@@ -2203,68 +2257,426 @@ class TestAnalyze:
         cas.aly.matrix.vm_df = vm_df
         cas.aly.matrix.write()
 
-    @requires_base_config
-    def test_max_date_reached(self):
-        start_date, date1, date2, date3, date4 = [
-            (dt.datetime.today() - dt.timedelta(days=i)).strftime('%Y-%m-%d')
-            for i in range(60, 55, -1)]
-        end_date = dt.datetime.today()
-        end_date = end_date.strftime('%Y-%m-%d')
-        test_csv_path = 'raw_data/amazon_test.csv'
-        date_list = [start_date, date1, date4, date3, date2]
-        place_list = ['amz_test_1', 'amz_test_2', 'amz_test_3', 'amz_test_4',
-                      'amz_test_5']
-        test_csv_df = pd.DataFrame({vmc.date: date_list,
-                                    vmc.placement: place_list,
-                                    vmc.cost: [1, 2, 3, 4, 5]})
-        test_csv_df.to_csv(test_csv_path, index=False)
+    def test_split_date_range_even(self):
+        """A window that is a multiple of the cap splits into equal,
+        day disjoint pieces that touch: each start is the previous end
+        plus one day, the way the old card split laid its dates out."""
+        sd = pd.Timestamp('2026-01-01')
+        ed = pd.Timestamp('2026-03-01')
+        windows = utl.split_date_range(sd, ed, 30)
+        assert windows == [(sd, pd.Timestamp('2026-01-30')),
+                           (pd.Timestamp('2026-01-31'), ed)]
+        for (_, prev_ed), (next_sd, _) in zip(windows, windows[1:]):
+            assert next_sd == prev_ed + pd.Timedelta(days=1)
+
+    def test_split_date_range_remainder_and_edges(self):
+        """The last piece takes the remainder and ends on the window's
+        own end, but is never one day, which the APIs would widen into
+        the piece before it; anything not needing a split is handed back
+        as the single piece it was, an unset date included."""
+        sd = pd.Timestamp('2026-01-01')
+        ends = [w[1] for w in utl.split_date_range(
+            sd, pd.Timestamp('2026-01-31'), 10)]
+        assert ends == [pd.Timestamp('2026-01-10'),
+                        pd.Timestamp('2026-01-20'),
+                        pd.Timestamp('2026-01-29'),
+                        pd.Timestamp('2026-01-31')]
+        tail = utl.split_date_range(sd, pd.Timestamp('2026-01-31'), 30)
+        assert tail == [(sd, pd.Timestamp('2026-01-29')),
+                        (pd.Timestamp('2026-01-30'),
+                         pd.Timestamp('2026-01-31'))]
+        short = pd.Timestamp('2026-01-05')
+        assert utl.split_date_range(sd, short, 30) == [(sd, short)]
+        far = pd.Timestamp('2026-12-31')
+        assert utl.split_date_range(sd, far, None) == [(sd, far)]
+        assert utl.split_date_range(sd, None, 30) == [(sd, None)]
+        assert utl.split_date_range(None, None, 30) == [(None, None)]
+        assert utl.split_date_range(sd, sd, 30) == [(sd, sd)]
+        mixed = utl.split_date_range(dt.date(2026, 1, 1),
+                                     dt.datetime(2026, 3, 1), 30)
+        assert len(mixed) == 2
+        assert mixed[0][0] == sd
+
+    def test_api_date_chunking(self):
+        """A capped API is pulled in pieces one day short of its cap that
+        touch and are concatenated; an uncapped one is called once with
+        the window untouched; an open or future end date reads as today
+        only when there is a cap."""
+        handler = ih.ImportHandler(None, None)
+        api = _CappedApi()
+        sd, ed = pd.Timestamp('2026-01-01'), pd.Timestamp('2026-03-01')
+        df = handler.get_data_in_windows(api, sd, ed, None, 'T')
+        assert len(api.calls) == 3
+        assert api.calls[1][0] == api.calls[0][1] + pd.Timedelta(days=1)
+        assert (api.calls[0][1] - api.calls[0][0]).days == 28
+        assert api.calls[-1][1] == ed
+        assert len(df) == 3
+        api = _OpenApi()
+        df = handler.get_data_in_windows(api, sd, ed, None, 'O')
+        assert api.calls == [(sd, ed)]
+        assert len(df) == 1
+        today = pd.Timestamp(dt.date.today())
+        sd = today - pd.Timedelta(days=100)
+        api = _CappedApi()
+        handler.get_data_in_windows(api, sd, None, None, 'T')
+        assert len(api.calls) == 4
+        assert api.calls[-1][1] == today
+        api = _CappedApi()
+        future = today + pd.Timedelta(days=60)
+        handler.get_data_in_windows(api, sd, future, None, 'T')
+        assert len(api.calls) == 4
+        assert api.calls[-1][1] == today
+        api = _OpenApi()
+        handler.get_data_in_windows(api, sd, None, None, 'O')
+        assert api.calls == [(sd, None)]
+        api = _UndatedApi()
+        handler.get_data_in_windows(api, sd, None, ['Unique'], 'U')
+        assert api.calls == [(sd, None)]
+
+    def test_api_date_chunking_skips_empty_pieces(self):
+        """Empty pieces are left out, and all empty is an empty frame."""
+        df = ih.ImportHandler(None, None).get_data_in_windows(
+            _EmptyApi(), pd.Timestamp('2026-01-01'),
+            pd.Timestamp('2026-01-31'), None, 'E')
+        assert df.empty
+
+    def test_pull_window(self, tmp_path):
+        """An uncapped card, or one that fits in a piece, is untouched.
+        A long card is pulled in full only until its file exists; after
+        that each run asks for the trailing piece, one day short of the
+        cap, and merges it.  A card with API_MERGE keeps the window
+        set_start gave it, and a card without a DATE column cannot be
+        merged so keeps pulling in full."""
+        nan = float('nan')
+        dc = [vmc.date]
+        missing = str(tmp_path / 'none.csv')
+        present = str(tmp_path / 'raw.csv')
+        pd.DataFrame({'a': [1]}).to_csv(present, index=False)
+        sd, ed = pd.Timestamp('2026-01-01'), pd.Timestamp('2026-06-30')
+        pw = ih.ImportHandler.pull_window
+        got = pw(_OpenApi(), sd, ed, nan, present, date_col=dc)
+        assert got == (sd, ed, False)
+        got = pw(_OpenApi(), sd, ed, 30, present, date_col=dc)
+        assert got == (sd, ed, True)
+        short = pd.Timestamp('2026-01-20')
+        got = pw(_CappedApi(), sd, short, nan, present, date_col=dc)
+        assert got == (sd, short, False)
+        got = pw(_CappedApi(), sd, ed, nan, missing, date_col=dc)
+        assert got == (sd, ed, False)
+        got = pw(_CappedApi(), sd, ed, nan, present, date_col=dc)
+        assert got == (ed - pd.Timedelta(days=28), ed, True)
+        got = pw(_CappedApi(), sd, ed, 60, present, date_col=dc)
+        assert got == (sd, ed, True)
+        got = pw(_CappedApi(), sd, ed, nan, present, date_col=['nan'])
+        assert got == (sd, ed, False)
+        today = pd.Timestamp(dt.date.today())
+        got = pw(_CappedApi(), sd, None, nan, present, date_col=dc)
+        assert got == (today - pd.Timedelta(days=28), today, True)
+        got = pw(_CappedApi(), sd, today, nan, present, date_col=dc)
+        assert got == (today - pd.Timedelta(days=28), today, True)
+        future = today + pd.Timedelta(days=100)
+        got = pw(_CappedApi(), sd, future, nan, present, date_col=dc)
+        assert got == (today - pd.Timedelta(days=28), today, True)
+        got = pw(_CappedApi(), sd, future, nan, missing, date_col=dc)
+        assert got == (sd, today, False)
+        got = pw(_UndatedApi(), sd, ed, nan, present, ['Unique'], dc)
+        assert got == (sd, ed, False)
+
+    def test_capped_apis_declare_max_date_length(self):
+        """Every API the old date length check knew a cap for now
+        declares it on its class, where importhandler reads it.  The
+        Trade Desk is capped only when it pulls by campaign id; a card
+        naming a scheduled report ignores dates."""
+        caps = {vmc.api_amz_key: 30, vmc.api_amd_key: 30,
+                vmc.api_szk_key: 60, vmc.api_db_key: 60,
+                vmc.api_tik_key: 30, vmc.api_sc_key: 30,
+                vmc.api_cri_key: 99}
+        class_list = ih.ImportHandler(None, None).class_list
+        for key, cap in caps.items():
+            assert class_list[key]().max_date_length == cap, key
+        ttd = class_list[vmc.api_ttd_key]()
+        assert ttd.max_date_length is None
+        ttd.report_name = 'abc1234,def5678'
+        assert ttd.max_date_length == 80
+        ttd.report_name = 'Weekly Report'
+        assert ttd.max_date_length is None
+
+    def test_date_cap_skips_undated_fields(self):
+        """A card whose fields ask for lifetime or total rows has no
+        daily dates to cut or merge on, so it is pulled as one report."""
+        cap = ih.ImportHandler.date_cap
+        class_list = ih.ImportHandler(None, None).class_list
+        szk = class_list[vmc.api_szk_key]
+        assert cap(scapi.ScApi(), None) == 30
+        assert cap(scapi.ScApi(), ['Age']) == 30
+        assert cap(scapi.ScApi(), ['Unique']) is None
+        assert cap(szk(), ['Placement']) == 60
+        assert cap(szk(), ['Placement', 'Total']) is None
+        assert cap(szk(), ['Lifetime']) is None
+
+    def test_max_date_no_longer_splits(self):
+        """A card well past its API's cap stays one vendor key: the
+        check reports nothing to fix and the fix changes nothing."""
+        start_date = (dt.datetime.today() - dt.timedelta(
+            days=120)).strftime('%Y-%m-%d')
+        end_date = dt.datetime.today().strftime('%Y-%m-%d')
         vm_dict = pd.DataFrame({vmc.vendorkey: ['API_Amazon_Test'],
                                 vmc.startdate: [start_date],
                                 vmc.enddate: [end_date],
-                                vmc.filename: [test_csv_path],
+                                vmc.filename: ['raw_data/amazon_test.csv'],
                                 vmc.date: [vmc.date]})
         matrix = vm.VendorMatrix()
         matrix.vm_parse(vm_dict)
         adl = az.CheckApiDateLength(az.Analyze(matrix=matrix))
         df = adl.do_analysis()
-        assert vmc.api_amz_key in df[vmc.vendorkey][0]
-        assert date4 in str(df[adl.highest_date][0])
+        assert df.empty
         f_df = adl.fix_analysis(aly_dict=df, write=False)
-        assert 'API_' not in f_df.loc[0, vmc.vendorkey]
-        assert 'API_' in f_df.loc[1, vmc.vendorkey]
-        f_df[vmc.startdate] = pd.to_datetime(f_df[vmc.startdate])
-        f_df[vmc.enddate] = pd.to_datetime(f_df[vmc.enddate])
-        assert f_df.loc[0, vmc.enddate] == f_df.loc[
-            1, vmc.startdate] - pd.Timedelta(days=1)
+        assert f_df[vmc.vendorkey].tolist() == ['API_Amazon_Test']
 
-    @requires_base_config
-    def test_max_date_repeat_split(self):
-        """APIs with short windows split on every run.  Each new vendor key
-        must carry only its own start date, otherwise the stamps stack and
-        the name grows past the file name length limit."""
-        base_vk = 'API_Amazon_Repeat'
-        start_date = (dt.datetime.today() - dt.timedelta(
-            days=120)).strftime('%Y-%m-%d')
-        end_date = dt.datetime.today().strftime('%Y-%m-%d')
-        vm_dict = pd.DataFrame({vmc.vendorkey: [base_vk],
-                                vmc.startdate: [start_date],
-                                vmc.enddate: [end_date],
-                                vmc.filename: ['raw_data/amazon_repeat.csv'],
-                                vmc.date: [vmc.date]})
-        matrix = vm.VendorMatrix()
-        matrix.vm_parse(vm_dict)
-        adl = az.CheckApiDateLength(az.Analyze(matrix=matrix))
-        vk = base_vk
-        for _ in range(3):
-            aly_dict = pd.DataFrame({vmc.vendorkey: [vk],
-                                     adl.highest_date: [None],
-                                     adl.name: [31]})
-            f_df = adl.fix_analysis(aly_dict=aly_dict, write=False)
-            vk = [x for x in f_df[vmc.vendorkey] if 'API_' in x][0]
-            assert vk.count('_20') == 1
-            assert utl.remove_date_suffix(vk) == base_vk
-        new_fn = f_df[f_df[vmc.vendorkey] == vk][vmc.filename].iloc[0]
-        assert new_fn == '{}.csv'.format(vk.replace('API_', '').lower())
+    @staticmethod
+    def _merge_fixture(tmp_path):
+        """A raw file holding ten days of history and a handler."""
+        fn = str(tmp_path / 'raw.csv')
+        days = pd.date_range('2026-08-01', '2026-08-10')
+        pd.DataFrame({vmc.date: days.strftime('%Y-%m-%d'),
+                      'imps': list(range(10))}).to_csv(fn, index=False)
+        return ih.ImportHandler(None, None), fn
+
+    def test_merge_keeps_history_outside_the_pulled_window(self, tmp_path):
+        """File rows inside the pulled window are replaced; rows outside
+        it are kept.  The boundary day is counted once, which the old
+        API_MERGE got wrong."""
+        handler, fn = self._merge_fixture(tmp_path)
+        fresh = pd.DataFrame({vmc.date: ['2026-08-08', '2026-08-09',
+                                         '2026-08-10'],
+                              'imps': [100, 100, 100]})
+        window = (pd.Timestamp('2026-08-08'), pd.Timestamp('2026-08-10'))
+        out = handler.merge_df(fresh, fn, [vmc.date], window, 0, 0)
+        out = utl.data_to_type(out, date_col=[vmc.date])
+        assert len(out) == 10
+        assert out[vmc.date].is_unique
+        assert out.loc[out[vmc.date] == '2026-08-08', 'imps'].iloc[0] == 100
+        assert out.loc[out[vmc.date] == '2026-08-07', 'imps'].iloc[0] == 6
+
+    def test_merge_trailing_pull_keeps_history(self, tmp_path):
+        """The retention case: only the newest day is pulled, so every
+        older row in the file survives untouched."""
+        handler, fn = self._merge_fixture(tmp_path)
+        fresh = pd.DataFrame({vmc.date: ['2026-08-10'], 'imps': [7]})
+        window = (pd.Timestamp('2026-08-10'), pd.Timestamp('2026-08-10'))
+        out = handler.merge_df(fresh, fn, [vmc.date], window, 0, 0)
+        out = utl.data_to_type(out, date_col=[vmc.date])
+        assert len(out) == 10
+        assert out.loc[out[vmc.date] == '2026-08-01', 'imps'].iloc[0] == 0
+        assert out.loc[out[vmc.date] == '2026-08-10', 'imps'].iloc[0] == 7
+
+    def test_merge_tolerates_unset_date_and_rows(self, tmp_path):
+        """An unset DATE arrives as ['nan'] and an unset FIRSTROW as
+        nan; neither may crash, and without a date column the pull is
+        written as is."""
+        handler, fn = self._merge_fixture(tmp_path)
+        fresh = pd.DataFrame({vmc.date: ['2026-08-10'], 'imps': [7]})
+        window = (pd.Timestamp('2026-08-10'), None)
+        out = handler.merge_df(fresh, fn, ['nan'], window, np.nan, np.nan)
+        assert len(out) == 1
+        out = handler.merge_df(fresh, fn, [vmc.date], window, np.nan,
+                               np.nan)
+        assert len(out) == 10
+
+    def test_merge_drops_rows_outside_the_pulled_window(self, tmp_path):
+        """A pull row dated outside the window it was asked for is
+        dropped rather than doubled against the kept history."""
+        handler, fn = self._merge_fixture(tmp_path)
+        fresh = pd.DataFrame({vmc.date: ['2026-08-09', '2026-08-10'],
+                              'imps': [100, 100]})
+        window = (pd.Timestamp('2026-08-10'), pd.Timestamp('2026-08-10'))
+        out = handler.merge_df(fresh, fn, [vmc.date], window, 0, 0)
+        out = utl.data_to_type(out, date_col=[vmc.date])
+        assert out[vmc.date].is_unique
+        assert out.loc[out[vmc.date] == '2026-08-09', 'imps'].iloc[0] == 8
+
+    def test_merge_empty_pull_leaves_the_file_alone(self, tmp_path):
+        """An empty pull is an API that had nothing or failed; the file
+        keeps its history instead of losing the window asked for."""
+        handler, fn = self._merge_fixture(tmp_path)
+        window = (pd.Timestamp('2026-08-08'), pd.Timestamp('2026-08-10'))
+        out = handler.merge_df(pd.DataFrame(), fn, [vmc.date], window, 0, 0)
+        assert out.empty
+        handler.output(pd.DataFrame(), fn, float('nan'), 0, 0, [vmc.date],
+                       window[0], window[1], merge=True)
+        assert len(pd.read_csv(fn)) == 10
+        fresh = pd.DataFrame({'other': ['2026-08-10'], 'imps': [7]})
+        out = handler.merge_df(fresh, fn, [vmc.date], window, 0, 0)
+        assert out.empty
+
+    def test_merge_without_a_start_writes_the_pull_as_is(self, tmp_path):
+        """With no start the window is unknown, so the old overwrite is
+        the only honest result."""
+        handler, fn = self._merge_fixture(tmp_path)
+        fresh = pd.DataFrame({vmc.date: ['2026-08-10'], 'imps': [7]})
+        out = handler.merge_df(fresh, fn, [vmc.date], (None, None), 0, 0)
+        assert len(out) == 1
+        out = handler.merge_df(fresh, fn, [vmc.date], (pd.NaT, None), 0, 0)
+        assert len(out) == 1
+
+    def test_merge_first_row_applies_to_the_file_only(self, tmp_path):
+        """The file carries the FIRSTROW dummy header rows output added;
+        the fresh pull never does, so trimming it would drop real rows."""
+        handler, fn = self._merge_fixture(tmp_path)
+        utl.add_dummy_header(pd.read_csv(fn), 1).to_csv(fn, index=False)
+        fresh = pd.DataFrame({vmc.date: ['2026-08-10'], 'imps': [7]})
+        window = (pd.Timestamp('2026-08-10'), pd.Timestamp('2026-08-10'))
+        out = handler.merge_df(fresh, fn, [vmc.date], window, 1, 0)
+        assert len(out) == 11
+        assert list(out.iloc[0]) == list(out.columns)
+        out = utl.first_last_adj(out, 1, 0)
+        out = utl.data_to_type(out, date_col=[vmc.date])
+        row = out[out[vmc.date] == '2026-08-10']
+        assert int(row['imps'].iloc[0]) == 7
+
+    def test_merge_undated_rows_come_from_the_pull(self, tmp_path):
+        """Total rows carry no date; the pull's copy replaces the
+        file's rather than both being kept."""
+        handler, fn = self._merge_fixture(tmp_path)
+        df = pd.read_csv(fn)
+        df.loc[len(df)] = ['', 999]
+        df.to_csv(fn, index=False)
+        fresh = pd.DataFrame({vmc.date: ['2026-08-10', ''],
+                              'imps': [7, 555]})
+        window = (pd.Timestamp('2026-08-10'), pd.Timestamp('2026-08-10'))
+        out = handler.merge_df(fresh, fn, [vmc.date], window, 0, 0)
+        assert len(out) == 11
+        assert 999 not in out['imps'].tolist()
+        assert 555 in out['imps'].tolist()
+
+    def test_merge_open_end_replaces_the_tail_including_tomorrow(
+            self, tmp_path):
+        """A pull that ends today returns whatever the platform has from
+        the start on, rows an API dates tomorrow included, so an open
+        end replaces every file row from the start onward."""
+        handler, fn = self._merge_fixture(tmp_path)
+        today = pd.Timestamp(dt.date.today())
+        days = [today - pd.Timedelta(days=x) for x in (2, 1, 0, -1)]
+        pd.DataFrame({vmc.date: [x.strftime('%Y-%m-%d') for x in days],
+                      'imps': [1, 1, 1, 1]}).to_csv(fn, index=False)
+        fresh = pd.DataFrame({vmc.date: [x.strftime('%Y-%m-%d')
+                                         for x in days[1:]],
+                              'imps': [2, 2, 2]})
+        window = (today - pd.Timedelta(days=1), today)
+        out = handler.merge_df(fresh, fn, [vmc.date], window, 0, 0)
+        assert out['imps'].tolist() == [1, 2, 2, 2]
+
+    def test_window_helpers(self):
+        """date_in_window counts a bound on today, unlike date_removal,
+        and reads an end on or after today as open; merge_date_col,
+        pull_end, piece_days and raw_file_path handle the shapes the
+        vendor matrix hands over."""
+        today = pd.Timestamp(dt.date.today())
+        dates = pd.Series([today - pd.Timedelta(days=1), today,
+                           today + pd.Timedelta(days=1), pd.NaT])
+        window = utl.date_in_window
+        yesterday = today - pd.Timedelta(days=1)
+        assert window(dates, yesterday, None).tolist() == [
+            True, True, True, False]
+        assert window(dates, today, today).tolist() == [
+            False, True, True, False]
+        assert not window(dates, None, today).any()
+        past = today - pd.Timedelta(days=5)
+        assert not window(dates, past, past).any()
+        col = ih.ImportHandler.merge_date_col
+        assert col([vmc.date]) == vmc.date
+        assert col(vmc.date) == vmc.date
+        assert col(['nan']) is None
+        assert col(['']) is None
+        assert col([]) is None
+        assert col(float('nan')) is None
+        end = ih.ImportHandler.pull_end
+        assert end(None) == today
+        assert end(pd.NaT) == today
+        assert end(today + pd.Timedelta(days=3)) == today
+        assert end(past) == past
+        assert ih.ImportHandler.piece_days(30) == 29
+        assert ih.ImportHandler.piece_days(1) == 1
+        assert ih.ImportHandler.raw_file_path('a/b.csv') == 'a/b.csv'
+        assert ih.ImportHandler.raw_file_path('b.csv') == os.path.join(
+            utl.raw_path, 'b.csv')
+
+    def test_load_output_merges_the_api_merge_window(self, tmp_path):
+        """A loader's report carries its FIRSTROW rows and no dates of
+        its own, so API_MERGE replaces the trailing API_MERGE days up
+        to the card's end and keeps older history, whatever the card's
+        START DATE says."""
+        handler, fn = self._merge_fixture(tmp_path)
+        today = pd.Timestamp(dt.date.today())
+        days = pd.date_range(today - pd.Timedelta(days=30),
+                             today - pd.Timedelta(days=1))
+        file_df = pd.DataFrame({vmc.date: days.strftime('%Y-%m-%d'),
+                                'imps': [1] * 30})
+        utl.add_dummy_header(file_df, 1).to_csv(fn, index=False)
+        fresh = pd.DataFrame({vmc.date: days[-3:].strftime('%Y-%m-%d'),
+                              'imps': [2, 2, 2]})
+        fresh = utl.add_dummy_header(fresh, 1)
+        for start in (today, pd.Timestamp('2026-01-01')):
+            params = {vmc.filename: fn, vmc.apimerge: np.float64(7.0),
+                      vmc.firstrow: np.int64(1), vmc.lastrow: np.float64(0),
+                      vmc.date: [vmc.date], vmc.startdate: start,
+                      vmc.enddate: today}
+            handler.load_output(fresh.copy(), params)
+            out = utl.first_last_adj(pd.read_csv(fn), 1, 0)
+            assert len(out) == 26
+            assert out['imps'].astype(int).tolist() == [1] * 23 + [2] * 3
+
+    def test_api_calls_backfills_then_merges(self, tmp_path, monkeypatch):
+        """Run one of a long capped card pulls the whole window in pieces
+        and writes it; run two asks only for the trailing piece and the
+        file still holds every day once."""
+        monkeypatch.setattr(utl, 'raw_path', str(tmp_path))
+        monkeypatch.setattr(utl, 'drain_campaign_filter_stats', lambda: {})
+        monkeypatch.setattr(utl, 'write_campaign_filter_stats',
+                            lambda stats: None)
+        today = pd.Timestamp(dt.date.today())
+        params = {vmc.apifile: 'fake.json', vmc.filename: 'daily.csv',
+                  vmc.apimerge: np.float64('nan'), vmc.firstrow: np.int64(0),
+                  vmc.lastrow: np.int64(0), vmc.date: ['stat_datetime'],
+                  vmc.apifields: ['nan'], vmc.enddate: today,
+                  vmc.startdate: today - pd.Timedelta(days=99)}
+        handler = ih.ImportHandler(['all'], _CardMatrix(params))
+        api = _DailyApi()
+        handler.api_calls(['API_Fake_Card'], api)
+        assert len(api.calls) == 4
+        assert len(pd.read_csv(tmp_path / 'daily.csv')) == 100
+        api = _DailyApi()
+        handler.api_calls(['API_Fake_Card'], api)
+        assert api.calls == [(today - pd.Timedelta(days=28), today)]
+        raw = pd.read_csv(tmp_path / 'daily.csv')
+        assert len(raw) == 100
+        assert raw['stat_datetime'].is_unique
+
+    def test_set_start_open_end_date(self):
+        """API_MERGE on an open or future ended card reads the end as
+        today instead of raising or asking for days not yet served."""
+        sd = pd.Timestamp(dt.date.today() - dt.timedelta(days=90))
+        out = ih.ImportHandler.set_start(sd, None, 30)
+        assert out == pd.Timestamp(dt.date.today()) - pd.Timedelta(days=30)
+        assert ih.ImportHandler.set_start(sd, None, float('nan')) == sd
+        future = pd.Timestamp(dt.date.today()) + pd.Timedelta(days=40)
+        assert ih.ImportHandler.set_start(sd, future, 30) == out
+
+    def test_output_preserves_history_end_to_end(self, tmp_path):
+        """The user's case: a capped platform is asked only for its
+        trailing piece, so a re-pull returns only recent rows.  Through
+        output the file keeps its history instead of shrinking to them;
+        without merge it is overwritten as before."""
+        handler, fn = self._merge_fixture(tmp_path)
+        fresh = pd.DataFrame({vmc.date: ['2026-08-10'], 'imps': [7]})
+        handler.output(fresh, fn, float('nan'), 0, 0, [vmc.date],
+                       pd.Timestamp('2026-08-10'),
+                       pd.Timestamp('2026-08-10'), merge=True)
+        assert len(pd.read_csv(fn)) == 10
+        handler.output(fresh, fn, float('nan'), 0, 0, [vmc.date],
+                       pd.Timestamp('2026-08-10'),
+                       pd.Timestamp('2026-08-10'))
+        assert len(pd.read_csv(fn)) == 1
 
     def test_package_cap_over(self):
         df = {'mpVendor': ['Adwords', 'Facebook', 'Twitter'],
@@ -3940,6 +4352,77 @@ class TestRedditCampaignFilter:
         assert len(api.filter_df_on_campaign(df)) == 1
 
 
+class _RecordingDbApi(dbapi.DbApi):
+    """DbApi whose report step only records the ids it would run with."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen = None
+
+    def parse_campaign_filter(self):
+        pass
+
+    def get_report_df(self, sd, ed, fields):
+        self.seen = (self.query_id, self.report_id)
+        self.df = pd.DataFrame()
+
+    def filter_df_on_campaign(self, keep_on_no_match=True):
+        return self.df
+
+
+class TestApiPullState:
+    """Per-pull behaviour of the capped API classes, kept out of TestApis
+    so CI, which has no channel configs, still runs it."""
+
+    def test_amz_list_dates_inclusive_and_capped_at_today(self):
+        """A piece of a longer window keeps its last day, while an end
+        bumped past midnight still stops on today."""
+        sd, ed = dt.datetime(2026, 6, 1), dt.datetime(2026, 6, 30)
+        dates = amzapi.AmzApi.list_dates(sd, ed)
+        assert len(dates) == 30
+        assert dates[-1] == ed
+        today = dt.datetime.today()
+        dates = amzapi.AmzApi.list_dates(today - dt.timedelta(days=2),
+                                         today + dt.timedelta(days=1))
+        assert len(dates) == 3
+        assert dates[-1].date() == today.date()
+
+    def test_scapi_report_dimension_resets_per_pull(self):
+        """Fields are parsed on every pull; the dimension list must not
+        grow into report_dimension=age,age on the second one."""
+        api = scapi.ScApi()
+        api.parse_fields(['Age'])
+        api.set_initial_params()
+        api.parse_fields(['Age'])
+        assert api.report_dimension == ['age']
+
+    def test_scapi_closed_end_includes_its_day(self):
+        """Snapchat's end_time is exclusive, so a closed end, such as a
+        piece of a longer window, moves to the next midnight; an open
+        end stays as it is."""
+        api = scapi.ScApi()
+        sd, ed = dt.datetime(2026, 8, 1), dt.datetime(2026, 8, 30)
+        _, out, _ = api.get_data_default_check(sd, ed, None)
+        assert out == dt.datetime(2026, 8, 31)
+        today = dt.datetime.combine(dt.date.today(), dt.time())
+        _, out, _ = api.get_data_default_check(sd, today, None)
+        assert out == today
+        _, out, _ = api.get_data_default_check(None, None, None)
+        assert out.date() == dt.date.today()
+
+    def test_ttd_pull_starts_authorized(self, monkeypatch):
+        """Flags one pull sets must not silence or reshape the next."""
+        api = ttdapi.TtdApi()
+        api.report_name = 'abc1234'
+        api.is_authorized = False
+        api.report_name_is_advertiser = True
+        monkeypatch.setattr(api, 'get_report_for_multiple_campaigns',
+                            lambda sd, ed: pd.DataFrame())
+        api.get_data()
+        assert api.is_authorized
+        assert not api.report_name_is_advertiser
+
+
 class TestDbApiCampaignFilter:
     """DV360 only filters on campaign ids server side, so a campaign name
     has to be matched against the report after it downloads."""
@@ -3982,6 +4465,16 @@ class TestDbApiCampaignFilter:
         api = self.get_api(None)
         assert api.campaign_ids == []
         assert api.campaign_name_filter == []
+
+    def test_pull_starts_a_fresh_query(self):
+        """create_report reuses report_id once run_report has set it, so
+        a second pull on one instance would rerun the first pull's
+        query for the wrong dates unless each pull starts clean."""
+        api = _RecordingDbApi()
+        api.config = {'report_id': ''}
+        api.query_id, api.report_id = 'q1', 'r1'
+        api.get_data(dt.datetime(2026, 8, 1), dt.datetime(2026, 8, 2))
+        assert api.seen == (None, '')
 
     def test_youtube_fields_add_campaign_groups(self):
         api = dbapi.DbApi()
@@ -4076,17 +4569,17 @@ class TestDbApiCampaignFilter:
         """A report id from the config never carried the filter, so an
         empty report is real and must not cost a second pull."""
         api = self.get_api('36314869')
-        api.report_id = 'r1'
+        api.config = {'report_id': 'r1'}
         pulls = []
 
         def fake_get_report_df(sd, ed, fields):
-            pulls.append(list(api.campaign_ids))
+            pulls.append((list(api.campaign_ids), api.report_id))
             api.df = pd.DataFrame()
             return api.df
 
         monkeypatch.setattr(api, 'get_report_df', fake_get_report_df)
         api.get_data()
-        assert len(pulls) == 1
+        assert pulls == [(['36314869'], 'r1')]
 
     def test_filter_df_multiple_names(self):
         api = self.get_api('GameA, GameB')

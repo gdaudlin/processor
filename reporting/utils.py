@@ -550,6 +550,8 @@ def add_header(df, header, first_row):
 
 
 def add_dummy_header(df, header_len, location='head'):
+    if not header_len:
+        return df
     cols = df.columns
     dummy_df = pd.DataFrame(data=[cols] * header_len, columns=cols)
     if location == 'head':
@@ -625,6 +627,70 @@ def remove_date_suffix(name):
     :returns: a string of the name without any trailing date stamps
     """
     return re.sub(r'(_\d{4}-\d{2}-\d{2})+$', '', name)
+
+
+def split_date_range(sd, ed, max_days):
+    """
+    Cuts a pull window into day disjoint, inclusive pieces of at most
+    max_days, so a capped API is asked for a long card one report at a
+    time and one vendor key keeps one raw file.
+
+    A window with no cap, an unset end, or one already inside the cap
+    comes back as the single piece it was.  The tail is never a single
+    day: several APIs' date_check (Amazon, TikTok, Sizmek, Criteo)
+    widen a same day request by a day and would pull the previous
+    piece's last day twice.
+
+    :param sd: start of the window; a date, datetime or Timestamp
+    :param ed: inclusive end of the window, same types
+    :param max_days: most days one piece may span; falsy for no cap
+    :returns: list of (start, end) Timestamp pairs covering the window
+    """
+    unset = [x for x in (sd, ed) if x is None or x is pd.NaT]
+    if not max_days or unset:
+        return [(sd, ed)]
+    sd = pd.Timestamp(sd)
+    ed = pd.Timestamp(ed)
+    if ed <= sd:
+        return [(sd, ed)]
+    step = dt.timedelta(days=max_days)
+    one_day = dt.timedelta(days=1)
+    pieces = (ed - sd).days // max_days + 1
+    windows = []
+    for idx in range(pieces):
+        cur = sd + idx * step
+        windows.append((cur, min(cur + step - one_day, ed)))
+    tail_sd, tail_ed = windows[-1]
+    if len(windows) > 1 and max_days > 1 and tail_sd == tail_ed:
+        prev_sd, prev_ed = windows[-2]
+        windows[-2] = (prev_sd, prev_ed - one_day)
+        windows[-1] = (prev_ed, ed)
+    return windows
+
+
+def date_in_window(dates, sd, ed):
+    """
+    Marks the dates inside one inclusive window, the exact range an API
+    was asked for.  An unparseable date is never inside and an unset
+    start puts nothing inside.  An end that is unset or on or after
+    today is open: a pull ending today returns whatever the platform
+    has from the start on, rows an API dates tomorrow included.  Unlike
+    date_removal a bound that lands on today still counts.
+
+    :param dates: a Series already parsed to datetimes
+    :param sd: start of the window, None or NaT for none
+    :param ed: inclusive end of the window, None or NaT for open
+    :returns: boolean Series, True where the date is inside
+    """
+    if sd is None or sd is pd.NaT:
+        return pd.Series(False, index=dates.index)
+    inside = (dates >= pd.Timestamp(sd)) & dates.notna()
+    if ed is None or ed is pd.NaT:
+        return inside
+    ed = pd.Timestamp(ed)
+    if ed >= pd.Timestamp(dt.date.today()):
+        return inside
+    return inside & (dates <= ed)
 
 
 def date_check(sd, ed):

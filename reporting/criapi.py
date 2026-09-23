@@ -18,6 +18,7 @@ class CriApi(object):
     base_url = 'https://api.criteo.com'
     auth_url = '{}/oauth2/token'.format(base_url)
     version_url = '/2025-04/retail-media'
+    max_date_length = 99
     default_config_file_name = 'criapi.json'
     line_item_str = 'Line'
 

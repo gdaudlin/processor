@@ -34,6 +34,8 @@ class ScApi(object):
     campaign_filter_col = 'campaign_filter'
     campaign_col = 'Campaign'
     default_config_file_name = 'scconfig.json'
+    max_date_length = 30
+    undated_fields = ('Unique',)
 
     def __init__(self):
         self.config = None
@@ -137,6 +139,9 @@ class ScApi(object):
             sd = dt.datetime.today() - dt.timedelta(days=2)
         if ed is None:
             ed = dt.datetime.today() - dt.timedelta(days=1)
+        if ed.date() < dt.datetime.today().date():
+            # Snapchat's end_time is exclusive; a closed end keeps its day.
+            ed = ed + dt.timedelta(days=1)
         fields = self.parse_fields(fields)
         return sd, ed, fields
 
@@ -212,6 +217,7 @@ class ScApi(object):
     def set_initial_params(self):
         self.granularity = None
         self.breakdown = 'ad'
+        self.report_dimension = []
         self.df = pd.DataFrame()
         self.r = None
 

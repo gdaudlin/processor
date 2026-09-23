@@ -19,6 +19,7 @@ class TtdApi(object):
     ttd_url = 'https://api.thetradedesk.com/v3'
     walmart_url = 'https://api.dsp.walmart.com/v3'
     default_config_file_name = 'ttdconfig.json'
+    graphql_max_date_length = 80
 
     def __init__(self):
         self.df = pd.DataFrame()
@@ -38,6 +39,16 @@ class TtdApi(object):
         self.report_name_is_advertiser = False
         self.is_authorized = True
 
+    @property
+    def max_date_length(self):
+        """
+        The pull by campaign id serves 80 days a call; a card naming a
+        scheduled report ignores dates, so it has no cap and no merge.
+        """
+        if self.check_report_type():
+            return self.graphql_max_date_length
+        return None
+
     def input_config(self, config):
         logging.info('Loading TTD config file: {}'.format(config))
         self.configfile = os.path.join(config_path + config)
@@ -56,7 +67,8 @@ class TtdApi(object):
         if 'PASS' in self.config:
             self.password = self.config['PASS']
         self.ad_id = self.config['ADID']
-        self.report_name = self.config['Report Name']
+        name = self.config['Report Name']
+        self.report_name = '' if name is None else str(name)
         if 'Token' in self.config and self.config['Token']:
             self.query_token = self.config['Token']
             logging.info('Loaded token from config file.')
@@ -196,6 +208,8 @@ class TtdApi(object):
         otherwise it will assume the default and pull using report name
         :returns: dataframe
         """
+        self.is_authorized = True
+        self.report_name_is_advertiser = False
         if self.check_report_type():
             self.df = self.get_report_for_multiple_campaigns(sd, ed)
         else:
@@ -221,7 +235,7 @@ class TtdApi(object):
             else False.
         """
         if not val_to_check:
-            val_to_check = self.report_name
+            val_to_check = str(self.report_name or '')
         check = False
         if ' ' in val_to_check:
             return check

@@ -20,6 +20,7 @@ class TikApi(object):
     campaign_url = '/campaign/get/'
     advertiser_url = '/oauth2/advertiser/get/'
     ad_report_url = '/report/integrated/get/'
+    max_date_length = 30
     new_date = 'stat_time_day'
     old_date = 'stat_datetime'
     dimensions = ['stat_time_day', 'ad_id']

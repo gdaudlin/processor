@@ -93,22 +93,45 @@ class ImportHandler(object):
             vmc.api_asa_key: asaapi.AsaApi,
         }
 
+    @staticmethod
+    def raw_file_path(filename):
+        """
+        Resolves a card's FILENAME to the path it is written to.
+
+        :param filename: the card's FILENAME, bare or already a path
+        :returns: the path under raw_path, or the path given
+        """
+        if '/' in filename:
+            return filename
+        return os.path.join(utl.raw_path, filename)
+
     def output(self, api_df, filename, api_merge=None, first_row=None,
-               last_row=None, date_col=None, start_date=None, end_date=None):
+               last_row=None, date_col=None, start_date=None, end_date=None,
+               merge=False):
         """Writes a df to disk from an API
 
-        Keyword arguments:
-        api_df -- the dataframe to be written
-        filename -- the name of the file to write to on disk
+        When the pull covered only the tail of the file's history, the
+        rows the file already holds for earlier dates are kept and the
+        pulled window is replaced.  A card with API_MERGE set is merged
+        the same way over the window its caller derived from it.  With
+        neither, the file is overwritten as it always was.
+
+        :param api_df: the dataframe to be written
+        :param filename: the file to write, relative to raw_path
+        :param api_merge: the card's API_MERGE days, nan when unset
+        :param first_row: the card's FIRSTROW, nan when unset
+        :param last_row: the card's LASTROW, nan when unset
+        :param date_col: the card's DATE column list
+        :param start_date: the start the pull actually asked for
+        :param end_date: the end the pull asked for, None when open
+        :param merge: True when only start_date to end_date was pulled
         """
         utl.dir_check(utl.raw_path)
-        if '/' in filename:
-            full_file = filename
-        else:
-            full_file = os.path.join(utl.raw_path, filename)
-        if str(api_merge) != 'nan':
-            api_df = self.merge_df(api_df, full_file, date_col, start_date,
-                                   end_date, first_row, last_row, api_merge)
+        full_file = self.raw_file_path(filename)
+        if merge or str(api_merge) != 'nan':
+            api_df = self.merge_df(api_df, full_file, date_col,
+                                   (start_date, end_date), first_row,
+                                   last_row)
         self.write_df(api_df, full_file)
 
     def write_df(self, api_df, full_file, attempt=0):
@@ -126,26 +149,108 @@ class ImportHandler(object):
             logging.warning('Imported df empty - '
                             'not overwriting {}.'.format(full_file))
 
-    def merge_df(self, api_df, filename, date_col, start_date, end_date,
-                 first_row, last_row, api_merge):
-        if not os.path.isfile(filename):
-            return api_df
-        df = utl.import_read_csv(filename)
-        df = self.merge_df_cleaning(df, first_row, last_row, date_col, pd.NaT,
-                                    end_date - dt.timedelta(days=api_merge))
-        api_df = self.merge_df_cleaning(api_df, first_row, last_row, date_col,
-                                        start_date, end_date)
-        df = pd.concat([df, api_df], ignore_index=True).reset_index(drop=True)
-        df = utl.add_dummy_header(df, first_row)
-        df = utl.add_dummy_header(df, last_row, location='foot')
-        return df
+    def load_output(self, df, params):
+        """
+        Writes a report a loader fetched whole, merging it when the card
+        sets API_MERGE.
+
+        The FTP, database, S3 and Azure loaders take no dates, so the
+        window to replace is the trailing API_MERGE days up to the
+        card's end, and the report still carries the FIRSTROW rows the
+        loader put on it.
+
+        :param df: the report as the loader returned it
+        :param params: the card's vendor matrix parameters
+        """
+        api_merge = params[vmc.apimerge]
+        first_row, last_row = params[vmc.firstrow], params[vmc.lastrow]
+        sd, ed = params[vmc.startdate], params[vmc.enddate]
+        merge = str(api_merge) != 'nan'
+        if merge:
+            ed = self.pull_end(ed)
+            sd = ed - dt.timedelta(days=int(api_merge))
+            df = utl.first_last_adj(df, 0 if pd.isna(first_row) else first_row,
+                                    0 if pd.isna(last_row) else last_row)
+        self.output(df, params[vmc.filename], api_merge, first_row, last_row,
+                    params[vmc.date], sd, ed, merge=merge)
 
     @staticmethod
-    def merge_df_cleaning(df, first_row, last_row, date_col,
-                          start_date, end_date):
+    def merge_date_col(date_col):
+        """
+        Picks the column name a merge keys dates on, or None.
+
+        The vendor matrix hands DATE over as a one item list, and an
+        unset DATE arrives as the list ['nan'] rather than None.
+
+        :param date_col: the card's DATE parameter
+        :returns: the column name, or None when no usable one was set
+        """
+        if isinstance(date_col, str):
+            date_col = [date_col]
+        if not isinstance(date_col, list) or not date_col:
+            return None
+        col = str(date_col[0])
+        if col in ('', 'nan', 'None'):
+            return None
+        return col
+
+    def merge_df(self, api_df, filename, date_col, window, first_row,
+                 last_row):
+        """
+        Folds a fresh pull into the raw file without losing history.
+
+        File rows dated inside the pulled window are replaced and the
+        rest kept; fresh rows dated outside it are dropped so they cannot
+        double the kept rows.  Undated rows, such as totals, come from
+        the fresh pull alone.  An empty pull, or one the file cannot be
+        keyed against, leaves the file as it was.
+
+        :param api_df: the fresh pull
+        :param filename: the existing raw file
+        :param date_col: the card's DATE parameter
+        :param window: (start, end) the pull asked for, end may be None
+        :param first_row: the card's FIRSTROW, nan tolerated
+        :param last_row: the card's LASTROW, nan tolerated
+        :returns: the merged dataframe, or the pull when no file exists
+        """
+        if not os.path.isfile(filename) or api_df is None or api_df.empty:
+            return api_df
+        sd, ed = window
+        col = self.merge_date_col(date_col)
+        if not col or sd is None or sd is pd.NaT:
+            logging.warning(f'{filename} has no DATE column or start date '
+                            'to keep its history apart from the new pull; '
+                            'writing the pull as is.')
+            return api_df
+        first_row = 0 if pd.isna(first_row) else int(first_row)
+        last_row = 0 if pd.isna(last_row) else int(last_row)
+        df = utl.import_read_csv(filename)
+        if df is None or df.empty:
+            return api_df
         df = utl.first_last_adj(df, first_row, last_row)
-        df = utl.data_to_type(df, date_col=date_col)
-        df = utl.date_removal(df, date_col[0], start_date, end_date)
+        df = utl.data_to_type(df, date_col=[col], fill_empty=False)
+        api_df = utl.data_to_type(api_df, date_col=[col], fill_empty=False)
+        if col not in df.columns:
+            logging.warning(f'{filename} has no {col} column to keep its '
+                            'history apart from the new pull; writing the '
+                            'pull as is.')
+            return api_df
+        if col not in api_df.columns:
+            logging.warning(f'The pull for {filename} has no {col} column '
+                            'and cannot be merged; the file is kept as is.')
+            return api_df.iloc[0:0]
+        kept = df[~utl.date_in_window(df[col], sd, ed) & df[col].notna()]
+        inside = utl.date_in_window(api_df[col], sd, ed) | api_df[col].isna()
+        if (~inside).any():
+            logging.info(f'{int((~inside).sum())} rows of the pull fall '
+                         'outside the window asked for and are dropped.')
+        api_df = api_df[inside]
+        logging.info(f'Keeping {len(kept)} rows of history and adding '
+                     f'{len(api_df)} fresh rows to {filename}.')
+        df = pd.concat([kept, api_df], ignore_index=True,
+                       sort=False).reset_index(drop=True)
+        df = utl.add_dummy_header(df, first_row)
+        df = utl.add_dummy_header(df, last_row, location='foot')
         return df
 
     @staticmethod
@@ -172,12 +277,148 @@ class ImportHandler(object):
         return False
 
     @staticmethod
+    def pull_end(ed):
+        """
+        The last day a pull may ask for: the card's end, or today when
+        the end is open, unparsable or still in the future.
+
+        :param ed: the card's END DATE as api_calls sees it
+        :returns: a Timestamp on or before today
+        """
+        today = pd.Timestamp(dt.date.today())
+        if ed is None or ed is pd.NaT:
+            return today
+        return min(pd.Timestamp(ed), today)
+
+    @staticmethod
     def set_start(sd, ed, max_date):
-        if str(max_date) != 'nan':
-            date_diff = (ed - sd).days
-            if date_diff >= max_date:
-                sd = ed - dt.timedelta(days=max_date)
+        """
+        Shortens a card's start to its API_MERGE window.
+
+        An open or future end date reads as today, which is as far as
+        any API can serve; without that an API_MERGE card could be
+        asked for a window that has not happened yet.
+
+        :param sd: the card's start date
+        :param ed: the card's end date, None when open
+        :param max_date: the card's API_MERGE days, nan when unset
+        :returns: the start date to pull from
+        """
+        if str(max_date) == 'nan' or sd is None:
+            return sd
+        ed = ImportHandler.pull_end(ed)
+        date_diff = (ed - sd).days
+        if date_diff >= max_date:
+            sd = ed - dt.timedelta(days=int(max_date))
         return sd
+
+    @staticmethod
+    def date_cap(api_class, fields):
+        """
+        The most days the API serves in one report, or None when the
+        card's fields ask for lifetime or total rows, which carry no
+        dates to cut or merge on.
+
+        :param api_class: the configured API instance
+        :param fields: the card's API_FIELDS, None when unset
+        :returns: the cap in days, or None for an uncapped pull
+        """
+        undated = getattr(api_class, 'undated_fields', ())
+        if fields and set(fields) & set(undated):
+            return None
+        return getattr(api_class, 'max_date_length', None)
+
+    @staticmethod
+    def piece_days(max_days):
+        """
+        Days one pull may span: one short of the API's cap, so an API
+        that bumps a same-day end to tomorrow still fits inside it.
+
+        :param max_days: the API's max_date_length
+        :returns: the days a piece may cover, at least one
+        """
+        return max(max_days - 1, 1)
+
+    @staticmethod
+    def pull_window(api_class, sd, ed, api_merge, filename, fields=None,
+                    date_col=None):
+        """
+        Decides what part of a card's window one run should pull.
+
+        A card longer than its API serves in one report is pulled in
+        full, in pieces, only while it has no raw file.  After that each
+        run asks for the trailing piece and merges it, so history the
+        platform no longer serves is never re-requested or lost.  A card
+        with API_MERGE keeps the window set_start gave it.  An uncapped
+        card, one that fits in a piece, or one with no DATE column to
+        merge on, is left as it was.
+
+        :param api_class: the configured API instance
+        :param sd: the card's start, already through set_start
+        :param ed: the card's end; open, unparsable and future ends
+            read as today
+        :param api_merge: the card's API_MERGE days, nan when unset
+        :param filename: the raw file the card writes to
+        :param fields: the card's API_FIELDS, None when unset
+        :param date_col: the card's DATE parameter, None when unset
+        :returns: the pull start, the pull end, and whether to merge
+        """
+        max_days = ImportHandler.date_cap(api_class, fields)
+        has_file = os.path.isfile(filename)
+        merge = has_file and str(api_merge) != 'nan'
+        if not max_days or sd is None or sd is pd.NaT:
+            return sd, ed, merge
+        piece = ImportHandler.piece_days(max_days)
+        last = ImportHandler.pull_end(ed)
+        if (last - pd.Timestamp(sd)).days < piece:
+            return sd, ed, merge
+        keyed = ImportHandler.merge_date_col(date_col) is not None
+        if not has_file or merge or not keyed:
+            return sd, last, merge
+        return last - dt.timedelta(days=piece - 1), last, True
+
+    @staticmethod
+    def get_data_in_windows(api_class, sd, ed, fields, vk):
+        """
+        Pulls a window from an API in pieces it can serve.
+
+        A window longer than the API's cap is cut into pieces one day
+        short of it, none reaching past today, each pulled with its own
+        get_data call, and the frames concatenated.  A window that fits,
+        or an uncapped pull, is one call with the dates untouched, so an
+        open end still reaches the API as it always did.
+
+        :param api_class: the configured API instance
+        :param sd: the start to pull from
+        :param ed: the end to pull to, None when open
+        :param fields: the card's API_FIELDS
+        :param vk: the vendor key, for the log line
+        :returns: the concatenated dataframe, empty when nothing came
+        """
+        max_days = ImportHandler.date_cap(api_class, fields)
+        split_ed = ed
+        if max_days:
+            split_ed = ImportHandler.pull_end(ed)
+            max_days = ImportHandler.piece_days(max_days)
+        windows = utl.split_date_range(sd, split_ed, max_days)
+        if len(windows) == 1:
+            df = api_class.get_data(sd=sd, ed=ed, fields=fields)
+            return pd.DataFrame() if df is None else df
+        logging.info(f'{vk} is pulled in {len(windows)} pieces of at most '
+                     f'{max_days} days.')
+        frames = []
+        for piece_sd, piece_ed in windows:
+            df = api_class.get_data(sd=piece_sd, ed=piece_ed, fields=fields)
+            if df is None or df.empty:
+                logging.warning(f'{vk} returned no rows for '
+                                f'{piece_sd:%Y-%m-%d} to {piece_ed:%Y-%m-%d}; '
+                                'if the API failed, delete the raw file to '
+                                'pull the card in full again.')
+                continue
+            frames.append(df)
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True, sort=False)
 
     def api_calls(self, key_list, api_class):
         """Makes an API Call
@@ -208,11 +449,15 @@ class ImportHandler(object):
             params[vmc.startdate] = self.set_start(params[vmc.startdate],
                                                    params[vmc.enddate],
                                                    params[vmc.apimerge])
+            full_file = self.raw_file_path(params[vmc.filename])
+            pull_sd, pull_ed, merge = self.pull_window(
+                api_class, params[vmc.startdate], params[vmc.enddate],
+                params[vmc.apimerge], full_file, params[vmc.apifields],
+                params[vmc.date])
             df = pd.DataFrame()
             try:
-                df = api_class.get_data(sd=params[vmc.startdate],
-                                        ed=params[vmc.enddate],
-                                        fields=params[vmc.apifields])
+                df = self.get_data_in_windows(api_class, pull_sd, pull_ed,
+                                              params[vmc.apifields], vk)
             except Exception as e:
                 logging.error("API error occurred", exc_info=True)
                 if hasattr(api_class, 'sw') and api_class.sw:
@@ -221,8 +466,7 @@ class ImportHandler(object):
                     raise e
             self.output(df, params[vmc.filename], params[vmc.apimerge],
                         params[vmc.firstrow], params[vmc.lastrow],
-                        params[vmc.date], params[vmc.startdate],
-                        params[vmc.enddate])
+                        params[vmc.date], pull_sd, pull_ed, merge=merge)
             stat = utl.drain_campaign_filter_stats()
             if stat:
                 stat['date'] = dt.datetime.today().strftime(
@@ -270,10 +514,7 @@ class ImportHandler(object):
             ftp_class.input_config(params[vmc.apifile])
             ftp_class.header = params[vmc.firstrow]
             df = ftp_class.get_data()
-            self.output(df, params[vmc.filename], params[vmc.apimerge],
-                        params[vmc.firstrow], params[vmc.lastrow],
-                        params[vmc.date], params[vmc.startdate],
-                        params[vmc.enddate])
+            self.load_output(df, params)
 
     def ftp_loop(self):
         if self.arg_check('sz'):
@@ -284,10 +525,7 @@ class ImportHandler(object):
             params = self.matrix.vendor_set(vk)
             db_class.input_config(params[vmc.apifile])
             df = db_class.get_data(filename=params[vmc.apifields][0])
-            self.output(df, params[vmc.filename], params[vmc.apimerge],
-                        params[vmc.firstrow], params[vmc.lastrow],
-                        params[vmc.date], params[vmc.startdate],
-                        params[vmc.enddate])
+            self.load_output(df, params)
 
     def db_loop(self):
         if self.arg_check('dna'):
@@ -305,10 +543,7 @@ class ImportHandler(object):
                 params[vmc.enddate] = None
             df = s3_class.get_data(sd=params[vmc.startdate],
                                    ed=params[vmc.enddate])
-            self.output(df, params[vmc.filename], params[vmc.apimerge],
-                        params[vmc.firstrow], params[vmc.lastrow],
-                        params[vmc.date], params[vmc.startdate],
-                        params[vmc.enddate])
+            self.load_output(df, params)
 
     def s3_loop(self):
         if self.arg_check('dna'):
@@ -320,10 +555,7 @@ class ImportHandler(object):
             azu_class.input_config(params[vmc.apifile])
             azu_class.header = params[vmc.firstrow]
             df = azu_class.get_data()
-            self.output(df, params[vmc.filename], params[vmc.apimerge],
-                        params[vmc.firstrow], params[vmc.lastrow],
-                        params[vmc.date], params[vmc.startdate],
-                        params[vmc.enddate])
+            self.load_output(df, params)
 
     def azu_loop(self):
         if self.arg_check('dna'):

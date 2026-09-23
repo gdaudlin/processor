@@ -2190,114 +2190,41 @@ class FindPlacementNameCol(AnalyzeBase):
 
 
 class CheckApiDateLength(AnalyzeBase):
-    """Checks APIs for max date length and splits data sources if necessary."""
+    """Reports that long API windows are pulled in pieces.
+
+    Cards used to be split into date stamped vendor keys near an API's
+    report limit.  importhandler now pulls the window in pieces and
+    merges, so the check finds nothing and the fix changes nothing; it
+    stays because the app files the max_api_length fix type against it.
+    """
     name = Analyze.max_api_length
     fix = True
     pre_run = True
-    highest_date = 'highest_date'
 
     def do_analysis(self):
         """
-        Loops through all data sources checking and flagging through those that
-        are too long.  Those sources are added to a df and the analysis dict
+        Says that no API card needs splitting.
+
+        :returns: an empty dataframe carrying the vendor key column
         """
-        vk_list = []
-        highest_date_list = []
-        data_sources = self.matrix.get_all_data_sources()
-        max_date_dict = {
-            vmc.api_amz_key: 31, vmc.api_szk_key: 60, vmc.api_db_key: 60,
-            vmc.api_tik_key: 30, vmc.api_ttd_key: 80, vmc.api_sc_key: 30,
-            vmc.api_amd_key: 30, vmc.api_cri_key: 99}
-        data_sources = [x for x in data_sources if 'API_' in x.key]
-        for ds in data_sources:
-            if 'API_' in ds.key and vmc.enddate in ds.p:
-                key = ds.key.split('_')[1]
-                if key in max_date_dict.keys():
-                    max_date = max_date_dict[key]
-                    date_range = (ds.p[vmc.enddate] - ds.p[vmc.startdate]).days
-                    if date_range > (max_date - 3):
-                        highest_date = None
-                        if vmc.filename in ds.p:
-                            file_name = ds.p[vmc.filename]
-                            if os.path.exists(file_name):
-                                date_col = ds.p[vmc.date]
-                                highest_date = self.find_highest_date(file_name,
-                                                                      date_col)
-                        vk_list.append(ds.key)
-                        highest_date_list.append(highest_date)
-        mdf = pd.DataFrame({vmc.vendorkey: vk_list,
-                            self.highest_date: highest_date_list})
+        msg = ('Long date windows are pulled in pieces, one vendor key '
+               'and one file per API card; no API cards need splitting.')
+        logging.info(msg)
+        mdf = pd.DataFrame({vmc.vendorkey: []})
         mdf[self.name] = ''
-        if vk_list:
-            msg = 'The following APIs are within 3 days of their max length:'
-            logging.info('{}\n{}'.format(msg, vk_list))
-            mdf[self.name] = mdf[vmc.vendorkey].str.split(
-                '_').str[1].replace(max_date_dict)
-        else:
-            msg = 'No APIs within 3 days of max length.'
-            logging.info('{}'.format(msg))
         self.add_to_analysis_dict(df=mdf, msg=msg)
         return mdf
 
-    @staticmethod
-    def find_highest_date(filename, date_col):
-        """
-        Scans raw csv returns the highest date in the column provided
-
-        :param filename: a string of the name of the csv found in vendormatrix
-        :param date_col: a string of the column header for date found in
-        vendormatrix
-        :returns: datetime object of highest date in file
-        """
-        df = utl.import_read_csv(filename)
-        df = utl.data_to_type(df, date_col=date_col)
-        max_date = df[date_col].max()
-        max_date = max_date[0]
-        return max_date
-
     def fix_analysis(self, aly_dict, write=True):
         """
-        Takes data sources that are too long and splits them based on date.
+        Leaves the vendor matrix unchanged.
 
-        :param aly_dict: a df containing items to fix
-        :param write: boolean will write the vm as csv when true
+        :param aly_dict: ignored, kept for the fix interface
+        :param write: ignored, there is nothing changed to write
         :returns: the vm as a df
         """
-        tdf = aly_dict.to_dict(orient='records')
-        df = self.aly.matrix.vm_df
-        for x in tdf:
-            vk = x[vmc.vendorkey]
-            logging.info('Duplicating vendor key {}'.format(vk))
-            max_date_length = x[self.name]
-            ndf = df[df[vmc.vendorkey] == vk].reset_index(drop=True)
-            ndf = utl.data_to_type(ndf, date_col=[vmc.startdate])
-            new_sd = ndf[vmc.startdate][0] + dt.timedelta(
-                days=max_date_length - 3)
-            if x[self.highest_date]:
-                tdf = utl.data_to_type(pd.DataFrame([x]),
-                                       date_col=[self.highest_date])
-                new_sd = tdf[self.highest_date][0] - dt.timedelta(days=3)
-            if new_sd.date() >= dt.datetime.today().date():
-                new_sd = dt.datetime.today() - dt.timedelta(days=3)
-            new_str_sd = new_sd.strftime('%Y-%m-%d')
-            ndf.loc[0, vmc.startdate] = new_str_sd
-            ndf.loc[0, vmc.enddate] = ''
-            new_vk = '{}_{}'.format(
-                utl.remove_date_suffix(vk), new_str_sd)
-            ndf.loc[0, vmc.vendorkey] = new_vk
-            file_type = os.path.splitext(ndf[vmc.filename][0])[1].lower()
-            new_fn = '{}{}'.format(new_vk.replace('API_', '').lower(),
-                                   file_type)
-            ndf.loc[0, vmc.filename] = new_fn
-            idx = df[df[vmc.vendorkey] == vk].index
-            df.loc[idx, vmc.vendorkey] = df.loc[
-                idx, vmc.vendorkey][idx[0]].replace('API_', '')
-            old_ed = new_sd - dt.timedelta(days=1)
-            df.loc[idx, vmc.enddate] = old_ed.strftime('%Y-%m-%d')
-            df = pd.concat([df, ndf]).reset_index(drop=True)
-        self.aly.matrix.vm_df = df
-        if write:
-            self.aly.matrix.write()
+        logging.info('API cards are no longer split on date length; '
+                     'nothing to fix.')
         return self.aly.matrix.vm_df
 
 

@@ -25,6 +25,8 @@ class SzkApi(object):
     login_url = 'https://adapi.sizmek.com/sas/login/login/'
     base_report_url = 'https://api.sizmek.com/rest/ReportBuilder/reports/'
     report_ex_route = 'executions'
+    max_date_length = 60
+    undated_fields = ('Total', 'Week', 'Lifetime')
     report_save_route = 'saveAndExecute'
     report_url = '{}{}'.format(base_report_url, report_save_route)
     report_get_url = '{}{}'.format(base_report_url, report_ex_route)
