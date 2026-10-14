@@ -1135,6 +1135,90 @@ def write_campaign_filter_stats(stats_by_vk, config_path_dir=None):
                         '{}'.format(e))
 
 
+api_run_stats_file = 'api_run_stats.json'
+api_run_success = 'success'
+api_run_empty = 'empty'
+api_run_error = 'error'
+api_run_skipped = 'skipped'
+_API_RUN_CAP = 500
+_API_RUN_ERROR_CHARS = 500
+
+
+def _api_run_date(value):
+    """A card's start or end date as ``YYYY-MM-DD``, or None when the
+    card left it open."""
+    if value is None or pd.isnull(value):
+        return None
+    if hasattr(value, 'date'):
+        value = value.date()
+    return str(value)
+
+
+def api_run_record(vendor_key, status, started=None, seconds=None, rows=0,
+                   error=None, start_date=None, end_date=None):
+    """One API card pull as the record the app lands in its ``api_run``
+    table once the run ends: which card, how it ended, how long it took
+    and how many rows came back.
+
+    :param vendor_key: the card's vendor key
+    :param status: one of the ``api_run_*`` statuses
+    :param started: when the pull began (UTC); now when omitted
+    :param seconds: how long the pull took
+    :param rows: rows the API returned
+    :param error: the exception that ended the pull, kept as its class
+        name and a bounded message so a traceback never lands in the file
+    :param start_date: first date the card asked for
+    :param end_date: last date the card asked for
+    :returns: the record dict
+    """
+    started = started or dt.datetime.utcnow()
+    return {
+        'vendor_key': str(vendor_key),
+        'started_at': started.replace(microsecond=0).isoformat(),
+        'seconds': round(seconds, 2) if seconds is not None else None,
+        'status': status,
+        'rows': int(rows or 0),
+        'error_type': type(error).__name__ if error else None,
+        'error_message': (str(error)[:_API_RUN_ERROR_CHARS]
+                          if error else None),
+        'start_date': _api_run_date(start_date),
+        'end_date': _api_run_date(end_date),
+    }
+
+
+def read_api_run_stats(config_path_dir=None):
+    """The pull records on file, oldest first; an unreadable file reads
+    as no records rather than raising into the run."""
+    file_name = os.path.join(config_path_dir or config_path,
+                             api_run_stats_file)
+    if not os.path.exists(file_name):
+        return []
+    try:
+        with open(file_name, 'r') as f:
+            records = json.load(f)
+    except (IOError, ValueError):
+        return []
+    return records if isinstance(records, list) else []
+
+
+def write_api_run_stats(records, config_path_dir=None):
+    """Append pull records to the config-dir JSON the app reads once the
+    run ends. Written per card rather than per run, so a card that
+    raises is already on file when the run dies with it."""
+    if not records:
+        return
+    file_dir = config_path_dir or config_path
+    file_name = os.path.join(file_dir, api_run_stats_file)
+    existing = read_api_run_stats(file_dir)
+    existing = (existing + list(records))[-_API_RUN_CAP:]
+    dir_check(file_dir)
+    try:
+        with open(file_name, 'w') as f:
+            json.dump(existing, f)
+    except IOError as e:
+        logging.warning(f'Could not write api run stats: {e}')
+
+
 def image_to_binary(file_name, as_bytes_io=False):
     if os.path.isfile(file_name):
         with open(file_name, 'rb') as image_file:

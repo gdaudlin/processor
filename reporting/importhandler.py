@@ -179,6 +179,31 @@ class ImportHandler(object):
                 sd = ed - dt.timedelta(days=max_date)
         return sd
 
+    @staticmethod
+    def record_pull(vk, params, started, timer, df=None, error=None):
+        """Put one card's pull on file for the app's API Status page
+        before anything else can end the run: the pull that raises is
+        the one the page most needs to know about.
+
+        :param vk: the card's vendor key
+        :param params: the card's vendor matrix row
+        :param started: when the pull began (UTC)
+        :param timer: ``time.perf_counter()`` at that moment
+        :param df: what the API returned, when it returned
+        :param error: the exception that ended the pull, if one did
+        """
+        rows = 0 if df is None else len(df)
+        if error is not None:
+            status = utl.api_run_error
+        elif rows:
+            status = utl.api_run_success
+        else:
+            status = utl.api_run_empty
+        utl.write_api_run_stats([utl.api_run_record(
+            vk, status, started=started, seconds=time.perf_counter() - timer,
+            rows=rows, error=error, start_date=params.get(vmc.startdate),
+            end_date=params.get(vmc.enddate))])
+
     def api_calls(self, key_list, api_class):
         """Makes an API Call
 
@@ -193,6 +218,8 @@ class ImportHandler(object):
                 api_class.input_config(params[vmc.apifile])
             except (FileNotFoundError, ValueError, SystemExit) as e:
                 logging.warning(e)
+                utl.write_api_run_stats([utl.api_run_record(
+                    vk, utl.api_run_skipped, error=e)])
                 continue
             # Clear records a previous key's failure left behind,
             # so nothing is attributed to the wrong card.
@@ -210,16 +237,21 @@ class ImportHandler(object):
                                                    params[vmc.enddate],
                                                    params[vmc.apimerge])
             df = pd.DataFrame()
+            started = dt.datetime.utcnow()
+            timer = time.perf_counter()
             try:
                 df = api_class.get_data(sd=params[vmc.startdate],
                                         ed=params[vmc.enddate],
                                         fields=params[vmc.apifields])
             except Exception as e:
                 logging.error("API error occurred", exc_info=True)
+                self.record_pull(vk, params, started, timer, error=e)
                 if hasattr(api_class, 'sw') and api_class.sw:
                     api_class.sw.quit()
                 else:
                     raise e
+            else:
+                self.record_pull(vk, params, started, timer, df=df)
             self.output(df, params[vmc.filename], params[vmc.apimerge],
                         params[vmc.firstrow], params[vmc.lastrow],
                         params[vmc.date], params[vmc.startdate],

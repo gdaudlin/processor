@@ -6931,3 +6931,122 @@ def test_slides_sparse_table_height_and_caption(monkeypatch):
              if 'insertText' in req]
     assert texts.count('Summary (continued)') == len(batches) - 1
     assert texts.count('Evidence') == len(batches)
+
+
+class _PullApi:
+    """An API class double for the import handler: answers
+    ``get_data`` with a frame or raises what it was built with."""
+
+    def __init__(self, df=None, error=None, config_error=None):
+        self.df = pd.DataFrame() if df is None else df
+        self.error = error
+        self.config_error = config_error
+
+    def input_config(self, config_file):
+        if self.config_error:
+            raise self.config_error
+
+    def get_data(self, sd=None, ed=None, fields=None):
+        if self.error:
+            raise self.error
+        return self.df
+
+
+class _PullMatrix:
+    """A vendor matrix double holding one card's parameters."""
+
+    def __init__(self, params):
+        self.params = params
+
+    def vendor_set(self, vk):
+        return dict(self.params)
+
+
+class TestApiRunStats:
+    """Every card pull leaves a record for the app's API Status page,
+    and the record for a pull that raises is on file before the raise."""
+
+    VK = 'API_Facebook_Launch'
+
+    @staticmethod
+    def _params():
+        return {vmc.apifile: 'fbconfig.json',
+                vmc.startdate: dt.datetime(2026, 10, 1),
+                vmc.enddate: dt.datetime(2026, 10, 13),
+                vmc.apifields: None, vmc.apimerge: float('nan'),
+                vmc.filename: 'fb_raw.csv', vmc.firstrow: 0,
+                vmc.lastrow: 0, vmc.date: [vmc.date]}
+
+    def _pull(self, api, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        handler = ih.ImportHandler('all', _PullMatrix(self._params()))
+        handler.api_calls([self.VK], api)
+        return utl.read_api_run_stats()
+
+    def test_record_shape(self):
+        error = ValueError('token expired ' * 200)
+        record = utl.api_run_record(
+            self.VK, utl.api_run_error, started=dt.datetime(2026, 10, 14, 3),
+            seconds=12.345, rows=0, error=error,
+            start_date=dt.datetime(2026, 10, 1), end_date=None)
+        assert record['vendor_key'] == self.VK
+        assert record['started_at'] == '2026-10-14T03:00:00'
+        assert record['seconds'] == 12.35
+        assert record['status'] == utl.api_run_error
+        assert record['error_type'] == 'ValueError'
+        assert len(record['error_message']) == utl._API_RUN_ERROR_CHARS
+        assert record['start_date'] == '2026-10-01'
+        assert record['end_date'] is None
+
+    def test_success_and_empty_pulls_are_on_file(self, tmp_path,
+                                                 monkeypatch):
+        df = pd.DataFrame({vmc.date: ['2026-10-12', '2026-10-13'],
+                           'Impressions': [1, 2]})
+        records = self._pull(_PullApi(df=df), tmp_path, monkeypatch)
+        assert [r['status'] for r in records] == [utl.api_run_success]
+        assert records[0]['rows'] == 2
+        assert records[0]['seconds'] >= 0
+        assert records[0]['start_date'] == '2026-10-01'
+        assert records[0]['end_date'] == '2026-10-13'
+        assert os.path.exists(os.path.join(utl.raw_path, 'fb_raw.csv'))
+        records = self._pull(_PullApi(), tmp_path, monkeypatch)
+        assert [r['status'] for r in records] == [
+            utl.api_run_success, utl.api_run_empty]
+        assert records[1]['rows'] == 0
+
+    def test_failed_pull_is_on_file_before_the_run_dies(self, tmp_path,
+                                                        monkeypatch):
+        with pytest.raises(ValueError):
+            self._pull(_PullApi(error=ValueError('bad token')), tmp_path,
+                       monkeypatch)
+        records = utl.read_api_run_stats()
+        assert len(records) == 1
+        assert records[0]['status'] == utl.api_run_error
+        assert records[0]['error_type'] == 'ValueError'
+        assert records[0]['error_message'] == 'bad token'
+
+    def test_unloadable_config_is_a_skipped_pull(self, tmp_path,
+                                                 monkeypatch):
+        records = self._pull(
+            _PullApi(config_error=FileNotFoundError('fbconfig.json')),
+            tmp_path, monkeypatch)
+        assert [r['status'] for r in records] == [utl.api_run_skipped]
+        assert records[0]['error_type'] == 'FileNotFoundError'
+        assert records[0]['rows'] == 0
+
+    def test_file_appends_caps_and_survives_corruption(self, tmp_path):
+        config_dir = str(tmp_path / 'config')
+        utl.write_api_run_stats([{'n': 0}], config_dir)
+        utl.write_api_run_stats([{'n': 1}, {'n': 2}], config_dir)
+        assert [r['n'] for r in utl.read_api_run_stats(config_dir)] == [
+            0, 1, 2]
+        utl.write_api_run_stats([{'n': i} for i in range(utl._API_RUN_CAP)],
+                                config_dir)
+        kept = utl.read_api_run_stats(config_dir)
+        assert len(kept) == utl._API_RUN_CAP
+        assert kept[-1]['n'] == utl._API_RUN_CAP - 1
+        with open(os.path.join(config_dir, utl.api_run_stats_file), 'w') as f:
+            f.write('{not json')
+        assert utl.read_api_run_stats(config_dir) == []
+        utl.write_api_run_stats([{'n': 9}], config_dir)
+        assert utl.read_api_run_stats(config_dir) == [{'n': 9}]
